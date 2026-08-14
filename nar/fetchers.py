@@ -187,12 +187,15 @@ def parse_course(text: str) -> dict:
 #   セレクタは SEL 辞書に集約。校正時はここだけ直せば済むようにしてある。
 # =====================================================================
 SEL = {
-    # --- netkeiba 地方 (db.netkeiba.com/race/<id>/) ---
-    "nk_race_title":  "diary_snap_cut, .racedata h1, .data_intro h1",
-    "nk_race_cond":   ".racedata diary_snap_cut span, .data_intro p span",
-    "nk_result_tbl":  "table.race_table_01, table.RaceTable01",
-    "nk_payout_tbl":  "table.pay_table_01, .Payout_Detail_Table",
-    # --- keiba.go.jp (NAR公式) ---
+    # --- nar.netkeiba.com (地方競馬。こちらが本命) ---
+    "nk_result_tbl":  ("table.RaceTable01, table.ResultTableWrap, "
+                       "div.ResultTableWrap table, table.race_table_01, "
+                       "table.result_table_02"),
+    "nk_payout_tbl":  ("table.Payout_Detail_Table, div.Result_Pay_Back table, "
+                       "table.pay_table_01"),
+    "nk_race_cond":   ".RaceData01, .RaceData02, .RaceList_Item02, .racedata",
+    "nk_race_title":  ".RaceName, .RaceList_ItemTitle, h1",
+    # --- keiba.go.jp (NAR公式。予備) ---
     "nar_result_tbl": "table.tb01, table.raceTable",
 }
 
@@ -218,7 +221,13 @@ COLMAP = {
     "確定着順": "finish_pos", "着順同着": "finish_pos",
     "単勝人気": "final_popularity", "人気順": "final_popularity",
     "所属": "belong_baba", "調教場所": "belong_baba",
+    # --- nar.netkeiba.com の実ヘッダ ---
+    "後3F": "last_3f", "後3ハロン": "last_3f",
+    "コーナー通過順": "corner_str", "通過順序": "corner_str",
+    "馬体重増減": "body_weight_str", "馬体重kg": "body_weight_str",
+    "タイム指数": None, "備考": None,
 }
+COLMAP = {k: v for k, v in COLMAP.items() if v is not None}
 
 
 def norm_header(h: str) -> str:
@@ -292,7 +301,8 @@ def parse_race_page(html: str, race_date: dt.date, baba_code: int,
     # --- レース条件 ---
     head_text = " ".join(
         e.get_text(" ", strip=True)
-        for e in soup.select("h1, .data_intro, .racedata, .RaceData01, .RaceData02")
+        for e in soup.select("h1, .RaceName, .RaceData01, .RaceData02, "
+                             ".RaceList_Item02, .data_intro, .racedata")
     )
     course = parse_course(head_text)
     grade, class_code, class_rank = normalize_class(head_text)

@@ -24,7 +24,7 @@ from bs4 import BeautifulSoup
 from .core import BABA
 from .fetchers import (Fetcher, SEL, COLMAP, parse_race_page, parse_payouts,
                        _table_to_dicts, dump, ParseError, norm_header)
-from .backfill import NK_URL
+from .backfill import NK_URL, ENCODING
 
 REQUIRED = {"finish_pos", "horse_no", "horse_name"}
 WANTED = {"final_win_odds", "final_popularity", "bracket_no", "sex_age",
@@ -62,8 +62,22 @@ def inspect(html: str, race_date: dt.date, baba: int, race_no: int) -> None:
         if score > best_score:
             best_i, best_score = i, score
 
-    if best_i is None:
-        print("\n!! テーブルが1つも無い。ログイン要求 or JS描画の可能性。")
+    # 全テーブルのヘッダが空 = 中身の無い枠だけのページ。
+    # 取得先ドメインが違う / 非開催 / JS描画 のいずれか。
+    all_empty = all(
+        not [c.get_text(strip=True)
+             for c in (t.find_all("tr") or [None])[0].find_all(["th", "td"])]
+        for t in tables if t.find_all("tr")
+    ) if tables else True
+
+    if best_i is None or all_empty:
+        print("\n!! 中身のあるテーブルが無い。")
+        print("   考えられる原因: 取得先ドメイン違い / 非開催 / JS描画")
+        text = soup.get_text(" ", strip=True)
+        print(f"\n--- ページ本文 冒頭600字 ---\n{text[:600]}")
+        print(f"\n--- 本文の長さ: {len(text):,}字 ---")
+        if len(text) < 200:
+            print("   → 本文がほぼ空。ドメイン違いの可能性が高い")
         return
 
     # ---------- 最有力テーブルの詳細 ----------
@@ -161,7 +175,7 @@ def main():
     else:
         url = NK_URL.format(y=d.year, b=a.baba, m=d.month, d=d.day, r=a.race)
         print(f"fetch: {url}")
-        html = Fetcher(min_interval=2.0).get(url, encoding="euc-jp")
+        html = Fetcher(min_interval=2.0).get(url, encoding=ENCODING)
         print(f"saved: {dump(html, f'calib-{a.date}-{a.baba}-{a.race}')}")
 
     inspect(html, d, a.baba, a.race)

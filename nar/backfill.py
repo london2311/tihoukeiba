@@ -23,9 +23,14 @@ from .core import (JST, BABA, EXCLUDE_BABA, connect, upsert, log_fetch,
                    make_race_id)
 from .fetchers import Fetcher, parse_race_page, ParseError
 
-# netkeiba 地方の race_id: YYYY + babaCode(2) + MM + DD + RR
-NK_URL = "https://db.netkeiba.com/race/{y:04d}{b:02d}{m:02d}{d:02d}{r:02d}/"
+# 地方競馬は nar.netkeiba.com 側にある。
+# db.netkeiba.com は中央用で、地方の race_id を渡しても空の枠だけが返る
+# (40KB あるのに <table> の中身が空、title も空、という症状になる)。
+# race_id: YYYY + babaCode(2) + MM + DD + RR
+NK_URL = ("https://nar.netkeiba.com/race/result.html"
+          "?race_id={y:04d}{b:02d}{m:02d}{d:02d}{r:02d}")
 MAX_R = 12
+ENCODING = "utf-8"   # nar 側は UTF-8。db 側の EUC-JP とは違う
 
 
 def enqueue_range(con, start: dt.date, end: dt.date,
@@ -91,7 +96,7 @@ def process(con, f: Fetcher, limit: int, deadline: dt.datetime | None = None,
         rid = row["race_id"]
         stat["seen"] += 1
         try:
-            html = f.get(row["source_url"], encoding="euc-jp")
+            html = f.get(row["source_url"], encoding=ENCODING)
             data = parse_race_page(
                 html,
                 dt.date.fromisoformat(row["race_date"]),
