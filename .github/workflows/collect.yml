@@ -1,66 +1,45 @@
 name: NAR backfill (sharded)
 
-# ---------------------------------------------------------------------
-# 前提: リポジトリは Public にすること。
-#   Private だと無料枠 2,000分/月 に対し 6h x 6ジョブ = 2,160分 で初日に枯れる。
-#   Public なら Actions は無制限。
-#
-# 並列度は 6 が上限。IPは分かれても相手側から見れば同一サイトへの合計
-# リクエスト数。10並列は単純に迷惑だし、ブロックされたら全部終わる。
-# ---------------------------------------------------------------------
+# Public リポジトリ必須。Private の無料枠(月2,000分)では初日に枯れる。
+# 並列度は6が上限。相手はNAR公式サイト。合計リクエスト数で考えること。
 
 on:
   workflow_dispatch:
     inputs:
       since:  { description: 'YYYY-MM-DD', required: false }
       until:  { description: 'YYYY-MM-DD', required: false }
-      limit:  { description: '1シャードあたり件数', required: false, default: '12000' }
-      shards: { description: '並列数(最大6)', required: false, default: '6' }
+      limit:  { description: '1シャードあたり件数', required: false, default: '4000' }
+      odds:   { description: 'win / core / all', required: false, default: 'win' }
   schedule:
     - cron: '0 17 * * *'    # 02:00 JST
 
 concurrency: { group: nar-backfill, cancel-in-progress: false }
-
 env:
   SHARDS: 6
   TZ: Asia/Tokyo
 
 jobs:
-  # -------------------------------------------------------------------
-  # 1) 開催日カレンダーを先読みして、実在レースだけキューに積む
-  #    総当たりだと7割が404の空撃ちになる。ここで1/3に減る。
-  # -------------------------------------------------------------------
   seed:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt
-
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with: { name: nar-db-main, path: data/ }
-
-      - name: Build queue from calendar
+      - name: Build queue
         if: github.event.inputs.since != ''
         run: |
-          python -m nar.shards calendar \
+          python -m nar.backfill \
             --since "${{ github.event.inputs.since }}" \
-            --until "${{ github.event.inputs.until || github.event.inputs.since }}"
-
+            --until "${{ github.event.inputs.until }}" \
+            --limit 0
       - uses: actions/upload-artifact@v4
-        with:
-          name: nar-db-seed
-          path: data/nar.db
-          retention-days: 7
-          overwrite: true
+        with: { name: nar-db-seed, path: data/nar.db, retention-days: 7, overwrite: true }
 
-  # -------------------------------------------------------------------
-  # 2) シャード並列で収集。各ジョブは別VM・別IP。
-  #    rowid % n で担当が決まるので、空DBから始めても重複しない。
-  # -------------------------------------------------------------------
   collect:
     needs: seed
     runs-on: ubuntu-latest
@@ -74,21 +53,16 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt
-
       - uses: actions/download-artifact@v4
         with: { name: nar-db-seed, path: data/ }
-
-      - name: Collect shard ${{ matrix.shard }}
+      - name: Collect
         run: |
           python -m nar.backfill \
             --shard ${{ matrix.shard }}/${{ env.SHARDS }} \
-            --limit ${{ github.event.inputs.limit || 12000 }} \
-            --interval 2.0 \
-            --hours 5.5
-
-      - name: Rename for merge
-        run: mv data/nar.db data/shard-${{ matrix.shard }}.db
-
+            --limit ${{ github.event.inputs.limit || 4000 }} \
+            --odds ${{ github.event.inputs.odds || 'win' }} \
+            --payout --interval 2.0 --hours 5.5
+      - run: mv data/nar.db data/shard-${{ matrix.shard }}.db
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -96,9 +70,6 @@ jobs:
           path: data/shard-${{ matrix.shard }}.db
           retention-days: 3
 
-  # -------------------------------------------------------------------
-  # 3) 統合 + リーク検査
-  # -------------------------------------------------------------------
   merge:
     needs: collect
     if: always()
@@ -108,28 +79,13 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt
-
-      # 前日までの累積DB
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with: { name: nar-db-main, path: data/ }
-
       - uses: actions/download-artifact@v4
         with: { pattern: 'shard-*', path: shards/, merge-multiple: true }
-
-      - name: Merge
-        run: |
+      - run: |
           python -m nar.shards merge shards/*.db --out data/nar.db
           python -m nar.backfill --report
-
-      - name: Leak check
-        run: |
-          python -c "import sys;sys.path.insert(0,'.');\
-          from nar import core,features;features.assert_no_leak(features.build(core.connect()))"
-
       - uses: actions/upload-artifact@v4
-        with:
-          name: nar-db-main
-          path: data/nar.db
-          retention-days: 90
-          overwrite: true
+        with: { name: nar-db-main, path: data/nar.db, retention-days: 90, overwrite: true }

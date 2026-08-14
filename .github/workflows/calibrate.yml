@@ -6,15 +6,19 @@ on:
       date:
         description: 'YYYY-MM-DD'
         required: true
-        default: '2026-08-01'
+        default: '2026-08-12'
       baba:
-        description: '44=大井 50=園田 54=高知'
+        description: '20=大井 27=園田 31=高知 19=船橋 21=川崎 24=名古屋'
         required: true
-        default: '44'
+        default: '20'
       race:
         description: 'レース番号'
         required: true
-        default: '11'
+        default: '9'
+      odds:
+        description: '確認する券種'
+        required: false
+        default: 'win,place,trifecta'
 
 jobs:
   calibrate:
@@ -29,4 +33,5 @@ jobs:
           python -m nar.calibrate \
             --date "${{ github.event.inputs.date }}" \
             --baba "${{ github.event.inputs.baba }}" \
-            --race "${{ github.event.inputs.race }}"
+            --race "${{ github.event.inputs.race }}" \
+            --odds "${{ github.event.inputs.odds }}"
