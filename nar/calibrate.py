@@ -24,6 +24,8 @@ def main():
                     help="この券種のページ構造を生ダンプする(例: trifecta)")
     ap.add_argument("--inspect-payout", action="store_true",
                     help="払戻ページの構造を生ダンプする")
+    ap.add_argument("--probe-full", default="",
+                    help="この券種で『全件表示』のパラメータを総当たり検証する")
     a = ap.parse_args()
 
     d = dt.date.fromisoformat(a.date)
@@ -94,6 +96,41 @@ def main():
             print("    !! 0件")
     except F.ParseError as e:
         print(f"  ✗ {e}")
+
+    # --- 全件表示パラメータの探索 ---
+    if a.probe_full:
+        bet = a.probe_full
+        n_horses = len(res["entries"])
+        expect = {"trifecta": n_horses*(n_horses-1)*(n_horses-2),
+                  "trio": n_horses*(n_horses-1)*(n_horses-2)//6,
+                  "exacta": n_horses*(n_horses-1),
+                  "quinella": n_horses*(n_horses-1)//2,
+                  "wide": n_horses*(n_horses-1)//2}.get(bet)
+        print(f"\n{'='*60}\n■ 全件表示の探索: {bet}  (期待 {expect}組 / {n_horses}頭)")
+        cands = ["", "&odds_flg=4", "&odds_flg=5", "&odds_flg=1", "&odds_flg=2",
+                 "&pop_flg=1", "&pop_flg=0", "&msgid=1"]
+        # 1着馬固定型のページ分割も試す
+        cands += [f"&k_odds3lentanBaCode={i}" for i in (1, 2)]
+        best = ("", 0)
+        for c in cands:
+            try:
+                h = f.get(F.url_odds(d, a.baba, a.race, bet, c))
+                got = len(F.parse_odds_page(h, rid, bet, "t"))
+            except Exception as e:
+                print(f"    {c or '(なし)':<28} ERROR {e}")
+                continue
+            flag = ""
+            if expect and got >= expect:
+                flag = "  ★全件"
+            elif got > best[1]:
+                flag = "  (現時点最多)"
+            if got > best[1]:
+                best = (c, got)
+            print(f"    {c or '(なし)':<28} {got:>5}組{flag}")
+        print(f"\n  → 最良: '{best[0] or '(なし)'}' で {best[1]}組")
+        if expect and best[1] < expect:
+            print(f"     !! 期待{expect}組に届かない。"
+                  "1着馬ごとのページ分割が必要な可能性")
 
     # --- 構造ダンプ(パーサが0件のときに原因を特定する) ---
     if a.inspect:

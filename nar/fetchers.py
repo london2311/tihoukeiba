@@ -80,9 +80,16 @@ def url_result(date: dt.date, baba: int, race_no: int) -> str:
             f"&k_raceNo={race_no}&k_babaCode={baba}")
 
 
-def url_odds(date: dt.date, baba: int, race_no: int, bet: str) -> str:
-    return (f"{BASE}/{BET_PAGES[bet]}?k_raceDate={_d(date)}"
-            f"&k_raceNo={race_no}&k_babaCode={baba}")
+def url_odds(date: dt.date, baba: int, race_no: int, bet: str,
+             extra: str = "") -> str:
+    u = (f"{BASE}/{BET_PAGES[bet]}?k_raceDate={_d(date)}"
+         f"&k_raceNo={race_no}&k_babaCode={baba}")
+    return u + extra
+
+
+# 三連単/三連複は既定で人気上位50件しか出ない。
+# 全件を出すためのパラメータ候補。実ページで有効なものを使う。
+FULL_LIST_PARAMS = ["&odds_flg=4", "&odds_flg=5", "&pop_flg=1", ""]
 
 
 def url_payout(date: dt.date, baba: int, race_no: int) -> str:
@@ -315,25 +322,57 @@ def parse_result_page(html: str, race_date: dt.date, baba: int,
 # =====================================================================
 def parse_odds_page(html: str, race_id: str, bet: str,
                     captured_at: str, tag: str = "final") -> list[dict]:
+    """
+    列構成が券種で違うので、行ごとに「組番らしいセル」と
+    「オッズらしいセル」を内容から判定する。列番号の決め打ちはしない。
+
+      単勝 : 馬番 | 馬名 | オッズ            -> ['1','ユスティニアン','108.1']
+      複勝 : 馬番 | 馬名 | 下限 - 上限
+      三連単: 順位 | 組合せ | オッズ          -> ['1','3-5-9','18.7'] ★1列目は人気順位
+    """
     soup = BeautifulSoup(html, "html.parser")
     out: list[dict] = []
+    single = bet in ("win", "place")
 
     for tr in soup.find_all("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
         if len(cells) < 2:
             continue
 
-        if bet in ("win", "place"):
-            if not re.match(r"^\d+$", cells[0]):
+        combo = None
+        if single:
+            # 先頭が純粋な数字＝馬番
+            if not re.fullmatch(r"\d+", cells[0]):
                 continue
             combo = str(int(cells[0]))
         else:
-            nums = re.findall(r"\d+", cells[0])
-            if not nums or not re.search(r"[-－‐]", cells[0]):
+            # 連結記号を含むセルを探す(1列目とは限らない)
+            for c in cells:
+                if re.fullmatch(r"[\d]+(?:\s*[-－‐→=]\s*[\d]+)+", c):
+                    nums = re.findall(r"\d+", c)
+                    combo = "-".join(str(int(n)) for n in nums)
+                    break
+            if combo is None:
                 continue
-            combo = "-".join(str(int(n)) for n in nums)
 
-        vals = re.findall(r"\d+(?:\.\d+)?", cells[-1].replace(",", ""))
+        # オッズ = 組番セルより後ろで、小数を含む最初のセル
+        odds_cell = None
+        seen_combo = False
+        for c in cells:
+            if not seen_combo:
+                if (single and re.fullmatch(r"\d+", c) and str(int(c)) == combo) \
+                   or (not single and re.findall(r"\d+", c)
+                       and "-".join(str(int(n)) for n in re.findall(r"\d+", c))
+                       == combo):
+                    seen_combo = True
+                continue
+            if re.search(r"\d+\.\d", c):
+                odds_cell = c
+                break
+        if odds_cell is None:
+            odds_cell = cells[-1]
+
+        vals = re.findall(r"\d+(?:\.\d+)?", odds_cell.replace(",", ""))
         if not vals:
             continue
         out.append({
@@ -344,7 +383,10 @@ def parse_odds_page(html: str, race_id: str, bet: str,
             "snapshot_tag": tag, "captured_at": captured_at,
             "min_to_post": None,
         })
-    return out
+
+    # 同一組番が複数回出たら最後を採用(重複表示対策)
+    dedup = {x["combination"]: x for x in out}
+    return list(dedup.values())
 
 
 # =====================================================================
@@ -360,26 +402,51 @@ BET_JP = {
 
 
 def parse_payout_page(html: str, race_id: str) -> list[dict]:
+    """
+    複勝・ワイドは1セルに複数組が詰まっている。実データ:
+      ['複勝', '3 5 11', '100円 110円 160円', '1 2 3']
+      ['ワイド', '3-5 3-11 5-11', '170円 ...', '1 ...']
+    → 組番と払戻金を同数に割って展開する。
+    """
     soup = BeautifulSoup(html, "html.parser")
     out = []
     for tr in soup.find_all("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-        if len(cells) < 2:
+        if len(cells) < 3:
             continue
         bet = BET_JP.get(cells[0].replace(" ", ""))
         if not bet:
             continue
-        nums = re.findall(r"\d+", cells[1])
-        yens = re.findall(r"[\d,]+", cells[2]) if len(cells) > 2 else []
-        if not nums or not yens:
+
+        yens = [int(y.replace(",", ""))
+                for y in re.findall(r"([\d,]+)\s*円", cells[2])]
+        if not yens:
+            yens = [int(y.replace(",", ""))
+                    for y in re.findall(r"[\d,]{2,}", cells[2])]
+        if not yens:
             continue
-        out.append({
-            "race_id": race_id, "bet_type": bet,
-            "combination": "-".join(str(int(n)) for n in nums),
-            "payout_yen": int(yens[0].replace(",", "")),
-            "popularity": int(cells[3]) if len(cells) > 3
-            and cells[3].isdigit() else None,
-        })
+
+        # 組番: 連結記号つきなら組単位、無ければ空白区切りの単体
+        combos = [
+            "-".join(str(int(n)) for n in re.findall(r"\d+", tok))
+            for tok in re.findall(r"\d+(?:\s*[-－‐→]\s*\d+)*", cells[1])
+        ]
+        # 複勝のように "3 5 11" が1トークンずつ拾われる場合はそのまま
+        combos = [c for c in combos if c]
+        if not combos:
+            continue
+
+        pops = re.findall(r"\d+", cells[3]) if len(cells) > 3 else []
+
+        # 組番と払戻の数が合わないときは、少ないほうに合わせる
+        n = min(len(combos), len(yens))
+        for i in range(n):
+            out.append({
+                "race_id": race_id, "bet_type": bet,
+                "combination": combos[i],
+                "payout_yen": yens[i],
+                "popularity": int(pops[i]) if i < len(pops) else None,
+            })
     return out
 
 
