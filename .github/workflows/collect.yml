@@ -1,17 +1,26 @@
 name: NAR backfill (sharded)
 
-# Public リポジトリ必須。Private の無料枠(月2,000分)では初日に枯れる。
-# 並列度は6が上限。相手はNAR公式サイト。合計リクエスト数で考えること。
+# Public リポジトリ必須。並列度は6が上限。
+#
+# ★seed も並列化してある★
+#   1日あたり全場ぶんの一覧を叩くので、3.5年分だと18,000リクエスト。
+#   直列だと20時間かかりジョブ上限(6h)で全損する。日付でシャード分割する。
+#   探索済みの(日付,場)は probed テーブルに記録され、再開時は飛ばす。
 
 on:
   workflow_dispatch:
     inputs:
       since:  { description: 'YYYY-MM-DD', required: false }
       until:  { description: 'YYYY-MM-DD', required: false }
-      limit:  { description: '1シャードあたり件数', required: false, default: '4000' }
+      limit:  { description: '1シャードあたり収集件数', required: false, default: '4000' }
       odds:   { description: 'win / core / all', required: false, default: 'win' }
+      skip_seed:
+        description: 'キュー構築を飛ばして収集だけ行う'
+        type: boolean
+        required: false
+        default: false
   schedule:
-    - cron: '0 17 * * *'    # 02:00 JST
+    - cron: '0 17 * * *'
 
 concurrency: { group: nar-backfill, cancel-in-progress: false }
 env:
@@ -19,29 +28,71 @@ env:
   TZ: Asia/Tokyo
 
 jobs:
+  # -------------------------------------------------------------------
+  # 1) キュー構築（日付でシャード分割・並列）
+  # -------------------------------------------------------------------
   seed:
+    if: github.event.inputs.skip_seed != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: pip }
+      - run: pip install -r requirements.txt
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { name: nar-db-main, path: data/ }
+
+      - name: Seed shard ${{ matrix.shard }}
+        run: |
+          python -m nar.backfill \
+            --since "${{ github.event.inputs.since || '2023-01-01' }}" \
+            --until "${{ github.event.inputs.until }}" \
+            --shard ${{ matrix.shard }}/${{ env.SHARDS }} \
+            --seed-only --interval 2.0 --hours 5.2
+
+      - run: mv data/nar.db data/seed-${{ matrix.shard }}.db
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()                       # ← 中断時も必ず保存する
+        with:
+          name: seed-${{ matrix.shard }}
+          path: data/seed-${{ matrix.shard }}.db
+          retention-days: 7
+
+  # -------------------------------------------------------------------
+  # 2) キューを1本に統合
+  # -------------------------------------------------------------------
+  seed-merge:
+    needs: seed
+    if: always() && github.event.inputs.skip_seed != 'true'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt
       - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with: { name: nar-db-main, path: data/ }
-      - name: Build queue
-        if: github.event.inputs.since != ''
-        run: |
-          python -m nar.backfill \
-            --since "${{ github.event.inputs.since }}" \
-            --until "${{ github.event.inputs.until }}" \
-            --limit 0
+        with: { pattern: 'seed-*', path: seeds/, merge-multiple: true }
+      - run: |
+          python -m nar.shards merge seeds/*.db --out data/nar.db
+          python -m nar.backfill --report
       - uses: actions/upload-artifact@v4
-        with: { name: nar-db-seed, path: data/nar.db, retention-days: 7, overwrite: true }
+        if: always()
+        with: { name: nar-db-seed, path: data/nar.db, retention-days: 7 }
 
+  # -------------------------------------------------------------------
+  # 3) 収集（並列）
+  # -------------------------------------------------------------------
   collect:
-    needs: seed
+    needs: seed-merge
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -53,16 +104,24 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt
+
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with: { name: nar-db-seed, path: data/ }
-      - name: Collect
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { name: nar-db-main, path: data/ }
+
+      - name: Collect shard ${{ matrix.shard }}
         run: |
           python -m nar.backfill \
             --shard ${{ matrix.shard }}/${{ env.SHARDS }} \
             --limit ${{ github.event.inputs.limit || 4000 }} \
             --odds ${{ github.event.inputs.odds || 'win' }} \
             --payout --interval 2.0 --hours 5.5
+
       - run: mv data/nar.db data/shard-${{ matrix.shard }}.db
+        if: always()
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -70,6 +129,9 @@ jobs:
           path: data/shard-${{ matrix.shard }}.db
           retention-days: 3
 
+  # -------------------------------------------------------------------
+  # 4) 統合
+  # -------------------------------------------------------------------
   merge:
     needs: collect
     if: always()
@@ -88,4 +150,5 @@ jobs:
           python -m nar.shards merge shards/*.db --out data/nar.db
           python -m nar.backfill --report
       - uses: actions/upload-artifact@v4
-        with: { name: nar-db-main, path: data/nar.db, retention-days: 90, overwrite: true }
+        if: always()
+        with: { name: nar-db-main, path: data/nar.db, retention-days: 90 }
