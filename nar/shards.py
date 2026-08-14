@@ -19,7 +19,7 @@ from .core import connect, DB_PATH
 
 # 統合対象テーブル(順序が外部キー依存なので races が先)
 MERGE_TABLES = ["races", "entries", "results", "payouts",
-                "odds_snapshots", "race_queue", "fetch_log"]
+                "odds_snapshots", "race_queue", "probed", "fetch_log"]
 
 
 def merge(shard_paths: list[Path], out: Path = DB_PATH) -> None:

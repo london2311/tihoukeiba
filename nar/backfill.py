@@ -36,43 +36,88 @@ ODDS_SETS = {
 # キュー構築 — 日別レース一覧から実在レースだけ積む
 # =====================================================================
 def enqueue_by_calendar(con, f: F.Fetcher, start: dt.date, end: dt.date,
-                        baba: list[int] | None = None) -> int:
-    targets = baba or [b for b in BABA if b not in EXCLUDE_BABA]
-    rows, day, hit_days = [], start, 0
+                        baba: list[int] | None = None,
+                        shard: tuple[int, int] | None = None,
+                        deadline: dt.datetime | None = None) -> int:
+    """
+    日別レース一覧を叩いて実在レースだけ積む。
 
-    while day <= end:
-        day_hit = False
+    ★コスト注意★
+      1日あたり全場ぶんのリクエストが要る。3.5年 × 14場 = 18,000リクエスト。
+      直列だと20時間かかり、Actions のジョブ上限(6h)を超えて全損する。
+      → shard=(i,n) で日付を分割し、matrix で並列化すること。
+      → 探索済みの (日付,場) は probed テーブルに記録し、再開時に飛ばす。
+    """
+    targets = baba or [b for b in BABA if b not in EXCLUDE_BABA]
+
+    # 探索済み記録(再開可能性)
+    con.execute("""CREATE TABLE IF NOT EXISTS probed (
+        race_date TEXT NOT NULL, baba_code INTEGER NOT NULL,
+        n_races INTEGER, probed_at TEXT,
+        PRIMARY KEY (race_date, baba_code))""")
+    con.commit()
+    done = {(r["race_date"], r["baba_code"])
+            for r in con.execute("SELECT race_date,baba_code FROM probed")}
+
+    # 対象日をシャードで分割
+    days = []
+    d = start
+    while d <= end:
+        days.append(d)
+        d += dt.timedelta(days=1)
+    if shard:
+        i, n = shard
+        days = [x for k, x in enumerate(days) if k % n == i]
+
+    rows, probed_rows, hit = [], [], 0
+    for day in days:
+        if deadline and dt.datetime.now(JST) >= deadline:
+            print("  deadline reached, stopping seed cleanly")
+            break
+        iso = day.isoformat()
         for b in targets:
+            if (iso, b) in done:
+                continue
             try:
-                html = f.get(F.url_race_list(day, b))
-                nos = F.parse_race_list(html)
+                nos = F.parse_race_list(f.get(F.url_race_list(day, b)))
             except F.ParseError:
                 nos = []
+            probed_rows.append({"race_date": iso, "baba_code": b,
+                                "n_races": len(nos),
+                                "probed_at": dt.datetime.now(JST).isoformat()})
             if not nos:
                 continue
-            day_hit = True
+            hit += 1
             for r in nos:
                 rows.append({
                     "race_id": make_race_id(day, b, r),
-                    "race_date": day.isoformat(),
-                    "baba_code": b, "race_no": r,
+                    "race_date": iso, "baba_code": b, "race_no": r,
                     "source_url": F.url_result(day, b, r),
                     "status": "pending", "attempts": 0, "last_error": None,
                     "updated_at": dt.datetime.now(JST).isoformat(),
                 })
-            print(f"  {day} {BABA[b]:4s} {len(nos)}R")
-        hit_days += day_hit
-        day += dt.timedelta(days=1)
+            print(f"  {iso} {BABA[b]:4s} {len(nos)}R")
 
-    if rows:
-        con.executemany("""INSERT OR IGNORE INTO race_queue
-            (race_id,race_date,baba_code,race_no,source_url,
-             status,attempts,last_error,updated_at)
-            VALUES (:race_id,:race_date,:baba_code,:race_no,:source_url,
-                    :status,:attempts,:last_error,:updated_at)""", rows)
+        # 日ごとにコミット。途中で落ちても進捗が残る
+        if probed_rows:
+            con.executemany("""INSERT OR REPLACE INTO probed
+                (race_date,baba_code,n_races,probed_at)
+                VALUES (:race_date,:baba_code,:n_races,:probed_at)""",
+                probed_rows)
+            probed_rows = []
+        if rows:
+            con.executemany("""INSERT OR IGNORE INTO race_queue
+                (race_id,race_date,baba_code,race_no,source_url,
+                 status,attempts,last_error,updated_at)
+                VALUES (:race_id,:race_date,:baba_code,:race_no,:source_url,
+                        :status,:attempts,:last_error,:updated_at)""", rows)
+            rows = []
         con.commit()
-    print(f"\n開催日 {hit_days}日 / 候補 {len(rows):,}R")
-    return len(rows)
+
+    total = con.execute("SELECT COUNT(*) c FROM race_queue").fetchone()["c"]
+    pr = con.execute("SELECT COUNT(*) c FROM probed").fetchone()["c"]
+    print(f"\n開催ヒット {hit}件 / 探索済み {pr:,}(日×場) / キュー計 {total:,}R")
+    return total
 
 
 def mark(con, race_id: str, status: str, err: str = "") -> None:
@@ -215,6 +260,8 @@ def main():
     ap.add_argument("--payout", action="store_true")
     ap.add_argument("--hours", type=float)
     ap.add_argument("--shard", help="'i/n'")
+    ap.add_argument("--seed-only", action="store_true",
+                    help="キュー構築だけして収集しない")
     ap.add_argument("--report", action="store_true")
     a = ap.parse_args()
 
@@ -224,12 +271,6 @@ def main():
 
     f = F.Fetcher(min_interval=a.interval)
 
-    if a.since:
-        end = dt.date.fromisoformat(a.until) if a.until else \
-            dt.date.today() - dt.timedelta(days=1)
-        baba = [int(x) for x in a.baba.split(",")] if a.baba else None
-        enqueue_by_calendar(con, f, dt.date.fromisoformat(a.since), end, baba)
-
     shard = None
     if a.shard:
         i, n = (int(x) for x in a.shard.split("/"))
@@ -237,6 +278,15 @@ def main():
 
     deadline = (dt.datetime.now(JST) + dt.timedelta(hours=a.hours)) \
         if a.hours else None
+
+    if a.since:
+        end = dt.date.fromisoformat(a.until) if a.until else \
+            dt.date.today() - dt.timedelta(days=1)
+        baba = [int(x) for x in a.baba.split(",")] if a.baba else None
+        enqueue_by_calendar(con, f, dt.date.fromisoformat(a.since), end,
+                            baba, shard, deadline)
+        if a.seed_only:
+            report(con); return
     bets = ODDS_SETS[a.odds]
     print(f"odds set = {a.odds} {bets}  ({len(bets)+1+int(a.payout)} req/race)")
 
