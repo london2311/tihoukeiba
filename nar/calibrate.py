@@ -20,6 +20,10 @@ def main():
     ap.add_argument("--race", type=int, default=11)
     ap.add_argument("--odds", default="win,place,trifecta",
                     help="確認する券種をカンマ区切り")
+    ap.add_argument("--inspect", default="",
+                    help="この券種のページ構造を生ダンプする(例: trifecta)")
+    ap.add_argument("--inspect-payout", action="store_true",
+                    help="払戻ページの構造を生ダンプする")
     a = ap.parse_args()
 
     d = dt.date.fromisoformat(a.date)
@@ -91,8 +95,49 @@ def main():
     except F.ParseError as e:
         print(f"  ✗ {e}")
 
+    # --- 構造ダンプ(パーサが0件のときに原因を特定する) ---
+    if a.inspect:
+        inspect_page(f.get(F.url_odds(d, a.baba, a.race, a.inspect)),
+                     f"オッズ({a.inspect})")
+    if a.inspect_payout:
+        inspect_page(f.get(F.url_payout(d, a.baba, a.race)), "払戻")
+
     print("\n" + "=" * 60)
     print("校正完了。バックフィルを開始してよい。")
+
+
+def inspect_page(html: str, label: str) -> None:
+    """ページ内の全テーブルを、セル単位で生のまま出す。
+    パーサが0件を返すときは、ここを見れば必ず原因が分かる。"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+
+    print(f"\n{'='*60}\n■ 構造ダンプ: {label}   (HTML {len(html):,} bytes)")
+
+    # そのページにあるリンクのパラメータ(ページ分割の手掛かり)
+    import re
+    params = set()
+    for a_ in soup.find_all("a", href=True):
+        for kv in re.findall(r"[?&]([a-zA-Z_0-9]+)=([^&\s\"]*)", a_["href"]):
+            params.add(kv[0])
+    print(f"  ページ内リンクのパラメータ: {sorted(params)}")
+
+    tables = soup.find_all("table")
+    print(f"  <table> {len(tables)}個")
+    for i, t in enumerate(tables):
+        rows = t.find_all("tr")
+        print(f"\n  --- table[{i}] class={t.get('class')} rows={len(rows)} ---")
+        for j, tr in enumerate(rows[:6]):
+            cells = [c.get_text(" ", strip=True)
+                     for c in tr.find_all(["th", "td"])]
+            tags = [c.name for c in tr.find_all(["th", "td"])]
+            print(f"    [{j}] {len(cells)}セル {tags} -> {cells}")
+        if len(rows) > 6:
+            print(f"    ... 他 {len(rows)-6}行")
+
+    if not tables:
+        txt = soup.get_text("\n", strip=True)
+        print(f"  !! テーブル無し。本文冒頭:\n{txt[:800]}")
 
 
 if __name__ == "__main__":
