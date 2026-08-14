@@ -18,7 +18,16 @@ on:
       odds:
         description: '確認する券種'
         required: false
-        default: 'win,place,trifecta'
+        default: 'win,place'
+      inspect:
+        description: '構造ダンプする券種 (trifecta / trio / wide など。空なら無し)'
+        required: false
+        default: 'trifecta'
+      inspect_payout:
+        description: '払戻の構造もダンプする'
+        type: boolean
+        required: false
+        default: true
 
 jobs:
   calibrate:
@@ -34,4 +43,6 @@ jobs:
             --date "${{ github.event.inputs.date }}" \
             --baba "${{ github.event.inputs.baba }}" \
             --race "${{ github.event.inputs.race }}" \
-            --odds "${{ github.event.inputs.odds }}"
+            --odds "${{ github.event.inputs.odds }}" \
+            --inspect "${{ github.event.inputs.inspect }}" \
+            ${{ github.event.inputs.inspect_payout == 'true' && '--inspect-payout' || '' }}
