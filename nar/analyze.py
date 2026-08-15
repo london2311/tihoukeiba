@@ -26,50 +26,15 @@ from . import oddscal
 
 
 # =====================================================================
-# クラス判定 (race_name から)
-#   NFKC 正規化で Ｂ２ -> B2 になる。全角half角の分岐を書かなくてよい。
+# クラス判定は raceclass.py に一本化する。
+# 診断で見ている式と features.py が使う式が違うと、
+# 「レポートでは64%取れているのにモデルには入っていない」事故が起きる。
 # =====================================================================
-CLASS_AB_RE = re.compile(r"(?<![A-Za-z])([ABCD])\s?([1-3])(?![0-9])")
-
-GRADE_WORDS = [
-    ("JpnI",   re.compile(r"JpnI(?!I)")),
-    ("JpnII",  re.compile(r"JpnII(?!I)")),
-    ("JpnIII", re.compile(r"JpnIII")),
-    ("GI",     re.compile(r"(?<![A-Za-z])GI(?!I)")),
-    ("重賞",   re.compile(r"重賞")),
-]
+from . import raceclass as RC
 
 
-def classify_race_name(name: str | None) -> tuple[str | None, str]:
-    """race_name -> (class_code, どのルールで当たったか)
-
-    返り値の class_code は core.CLASS_RANK のキーに合わせる。
-    当たらなければ (None, 'unmatched')。
-    """
-    if not name:
-        return None, "empty"
-    s = unicodedata.normalize("NFKC", name)
-
-    for label, rx in GRADE_WORDS:
-        if rx.search(s):
-            return label if label.startswith("Jpn") else "重賞", "grade"
-
-    m = CLASS_AB_RE.search(s)
-    if m:
-        return f"{m.group(1)}{m.group(2)}", "AB123"
-
-    # クラス記号なしの区分。CLASS_RANK には無いので別枠で数える
-    if re.search(r"オープン|ＯＰ|OP(?![A-Za-z])", s):
-        return "OPEN", "open"
-    if "未勝利" in s:
-        return "未勝利", "word"
-    if "新馬" in s or "デビュー" in s:
-        return "新馬", "word"
-    if re.search(r"(?<![0-9])2歳", s):
-        return "2歳", "age"
-    if re.search(r"(?<![0-9])3歳", s):
-        return "3歳", "age"
-    return None, "unmatched"
+def classify_race_name(name, baba_code=None):
+    return RC.classify(name, baba_code)
 
 
 # =====================================================================
@@ -135,15 +100,15 @@ def race_name_report(con) -> None:
     # ---------------- C ----------------
     print("\n" + "=" * 64)
     print("■ C. race_name からのクラス抽出テスト")
-    res = df["race_name"].apply(classify_race_name)
+    res = [RC.classify(n, b) for n, b in zip(df["race_name"], df["baba_code"])]
     df["class_code"] = [x[0] for x in res]
     df["rule"] = [x[1] for x in res]
 
     hit = df["class_code"].notna().sum()
-    ab = (df["rule"] == "AB123").sum()
+    ab = df["rule"].isin(["letter_num", "letter_only", "grade", "open"]).sum()
     print(f"  何らかのクラスが取れた   {hit:>7,} / {len(df):,}  "
           f"({hit/len(df)*100:5.1f}%)")
-    print(f"  うち A1..D2 の記号      {ab:>7,}          "
+    print(f"  うち強さの梯子に乗る  {ab:>7,}          "
           f"({ab/len(df)*100:5.1f}%)   ← features で直接使えるのはここ")
 
     print("\n  ルール別:")
@@ -154,9 +119,9 @@ def race_name_report(con) -> None:
     for code, n in df["class_code"].value_counts().head(20).items():
         print(f"    {code:<8} {n:>7,}")
 
-    print("\n  場別 A1..D2 抽出率:")
+    print("\n  場別 クラス抽出率:")
     for baba, g in df.groupby("baba_code"):
-        r = (g["rule"] == "AB123").mean() * 100
+        r = g["rule"].isin(["letter_num", "letter_only", "grade", "open"]).mean() * 100
         print(f"    {BABA.get(int(baba), str(baba)):<4}({int(baba):>2}) "
               f"{r:5.1f}%   n={len(g):,}")
 
@@ -273,6 +238,80 @@ def probe_corner_source(con, fetch: bool = True) -> None:
 
 
 # =====================================================================
+# F. 収集ゼロの場コードを検出し、原因を切り分ける
+#    「seed が queue に入れていない」のか
+#    「queue にはあるが取得に失敗している」のか
+#    「URL の場コード書式が違う」のかで対処が全く変わる
+# =====================================================================
+def probe_missing_baba(con, fetch: bool = True) -> None:
+    from .core import BABA, EXCLUDE_BABA
+    print("\n" + "=" * 64)
+    print("■ F. 収集ゼロの場")
+
+    have = {r[0] for r in con.execute("SELECT DISTINCT baba_code FROM races")}
+    missing = [b for b in sorted(BABA) if b not in have and b not in EXCLUDE_BABA]
+    if not missing:
+        print("  全場そろっている")
+        return
+    for b in missing:
+        print(f"  ★ {BABA[b]}({b}) のレースが0件")
+
+    # --- race_queue に積まれているか (seed の問題か収集の問題か) ---
+    try:
+        rows = con.execute("""
+            SELECT baba_code, status, COUNT(*) FROM race_queue
+            GROUP BY baba_code, status ORDER BY baba_code
+        """).fetchall()
+    except Exception as e:                          # noqa: BLE001
+        rows = []
+        print(f"  race_queue が読めない: {e}")
+    if rows:
+        print("\n  race_queue の内訳:")
+        for b, st, n in rows:
+            mark = "   ← 収集ゼロの場" if b in missing else ""
+            print(f"    {BABA.get(b, b):<5}({b:>2}) {st:<10} {n:>7,}{mark}")
+        qb = {r[0] for r in rows}
+        for b in missing:
+            if b not in qb:
+                print(f"    !! {BABA[b]}({b}) は queue にすら無い"
+                      " → seed(開催日探索)が拾えていない")
+
+    if not fetch:
+        print("  --no-fetch のため HTTP probe をスキップ")
+        return
+
+    # --- URL の場コード書式を実際に叩いて確かめる ---
+    import datetime as dt
+    from urllib.parse import quote
+    from . import fetchers as F
+    f = F.Fetcher(min_interval=1.5)
+    today = dt.date.today()
+    for b in missing:
+        print(f"\n  probe: {BABA[b]}({b}) 直近90日を5日おきに走査")
+        hit = False
+        for form in (str(b), f"{b:02d}"):
+            for off in range(0, 90, 5):
+                d = today - dt.timedelta(days=off)
+                url = (f"{F.BASE}/S_RaceList_ipat"
+                       f"?k_raceDate={quote(f'{d:%Y/%m/%d}', safe='')}"
+                       f"&k_babaCode={form}")
+                try:
+                    lst = F.parse_race_list(f.get(url))
+                except Exception:                   # noqa: BLE001
+                    continue
+                if lst:
+                    print(f"    ★開催あり  k_babaCode={form!r}  {d}  R={lst}")
+                    print(f"      {url}")
+                    hit = True
+                    break
+            if hit:
+                break
+        if not hit:
+            print("    90日間どちらの書式でも開催が見つからない")
+            print("    → 場コードが違うか、この期間は開催が無い")
+
+
+# =====================================================================
 def data_report(con, fetch: bool = True) -> None:
     print("=" * 64)
     print("■ データ概況")
@@ -326,10 +365,10 @@ def data_report(con, fetch: bool = True) -> None:
     race_name_report(con)
     parser_health(con)
     probe_corner_source(con, fetch=fetch)
+    probe_missing_baba(con, fetch=fetch)
 
     print("\n" + "=" * 64)
-    print("診断おわり。C の A1..D2 抽出率が 6割を超えていれば "
-          "features.py にクラスを入れる価値がある。")
+    print("診断おわり。")
 
 
 def calibrate(con) -> None:
