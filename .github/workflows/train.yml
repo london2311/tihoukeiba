@@ -3,6 +3,11 @@ name: Train
 on:
   workflow_dispatch:
     inputs:
+      sweep:
+        description: '総当たり比較モード（正則化5段階 x 特徴集合2通り）'
+        type: boolean
+        required: false
+        default: false
       cutoff:
         description: '学習/検証の境界日 (空ならオッズ完備開始日)'
         required: false
@@ -15,8 +20,13 @@ on:
         description: '過去N走未満の馬を除く'
         required: false
         default: '3'
+      no_temp:
+        description: '温度較正を無効にする（較正の効果を測るとき用）'
+        type: boolean
+        required: false
+        default: false
       run_id:
-        description: 'nar-db-main の実行ID (空なら最新を自動検索)'
+        description: 'nar-db-main の実行ID (空ならサイズ最大を自動選択)'
         required: false
         default: ''
 
@@ -36,21 +46,36 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
 
+      # ★作成日時ではなくサイズで選ぶ★ 空DB(約100KB)が最新に来ることがある
       - name: Find DB
         id: find
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -n "${{ github.event.inputs.run_id }}" ]; then
-            echo "run_id=${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT; exit 0
+            echo "run_id=${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT
+            echo "指定された run_id を使用: ${{ github.event.inputs.run_id }}"
+            exit 0
           fi
-          RID=$(gh api -X GET \
-            "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
-            --jq '[.artifacts[] | select(.name=="nar-db-main" and .expired==false)]
-                  | sort_by(.size_in_bytes) | reverse | .[0].workflow_run.id')
-          [ -z "$RID" ] || [ "$RID" = "null" ] && { echo "!! nar-db-main が無い"; exit 1; }
+          API="repos/${{ github.repository }}/actions/artifacts?per_page=100"
+          JQ='.artifacts[] | select(.name=="nar-db-main" and .expired==false) | "\(.size_in_bytes)\t\(.workflow_run.id)\t\(.created_at)"'
+          gh api --paginate "$API" --jq "$JQ" | sort -rn > /tmp/arts.tsv
+          echo "=== nar-db-main の候補 (サイズ降順) ==="
+          echo "bytes | run_id | created_at"
+          cat /tmp/arts.tsv
+          if [ ! -s /tmp/arts.tsv ]; then
+            echo "!! nar-db-main が1件も無い。Restore DB を先に実行すること"
+            exit 1
+          fi
+          SIZE=$(head -1 /tmp/arts.tsv | cut -f1)
+          RID=$(head -1 /tmp/arts.tsv | cut -f2)
+          if [ "$SIZE" -lt 5000000 ]; then
+            echo "!! 最大でも ${SIZE} bytes。全部空DB。Restore DB で作り直すこと"
+            exit 1
+          fi
+          echo "採用: run_id=$RID (${SIZE} bytes)"
           echo "run_id=$RID" >> $GITHUB_OUTPUT
-          echo "使用する run: $RID"
 
       - uses: actions/download-artifact@v4
         with:
@@ -62,17 +87,24 @@ jobs:
       - name: Verify
         run: |
           python - <<'EOF'
-          import sqlite3, sys
-          c = sqlite3.connect("data/nar.db")
+          import sqlite3, sys, pathlib
+          p = pathlib.Path("data/nar.db")
+          if not p.exists():
+              sys.exit("!! data/nar.db が無い")
+          print(f"nar.db = {p.stat().st_size/1024/1024:,.1f} MB")
+          c = sqlite3.connect(p)
           n = c.execute("SELECT COUNT(*) FROM races").fetchone()[0]
           o = c.execute("SELECT COUNT(*) FROM results WHERE final_win_odds IS NOT NULL").fetchone()[0]
           print(f"races={n:,} odds={o:,}")
-          if n == 0: sys.exit("!! DBが空")
+          if n < 1000:
+              sys.exit(f"!! races が {n} 件しかない。空DBを掴んでいる")
           EOF
 
       - name: Train
         run: |
           python -m nar.train \
+            ${{ github.event.inputs.sweep == 'true' && '--sweep' || '' }} \
+            ${{ github.event.inputs.no_temp == 'true' && '--no-temp' || '' }} \
             ${{ github.event.inputs.cutoff && format('--cutoff {0}', github.event.inputs.cutoff) || '' }} \
             --C ${{ github.event.inputs.C || '1.0' }} \
             --min-starts ${{ github.event.inputs.min_starts || '3' }}
