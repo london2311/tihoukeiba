@@ -4,6 +4,11 @@ name: Analyze
 #   既定では「同じ run 内」のアーティファクトしか見えない。
 #   別 run が作った nar-db-main を取るには run-id と github-token が要る。
 #   run-id を省略すると自分の run を見にいって "Artifact not found" になる。
+#
+# ★もうひとつの落とし穴★
+#   nar-db-main は複数の run に存在する。作成日時で選ぶと、
+#   収集ジョブが上げた空DB(約100KB)を掴むことがある。
+#   → サイズ降順で選び、5MB未満なら止める。
 
 on:
   workflow_dispatch:
@@ -13,7 +18,7 @@ on:
         required: true
         default: 'both'
       run_id:
-        description: 'nar-db-main を作った実行ID (空なら最新を自動検索)'
+        description: 'nar-db-main を作った実行ID (空ならサイズ最大を自動選択)'
         required: false
         default: ''
 
@@ -33,27 +38,37 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
 
-      # run_id 未指定なら、nar-db-main を持つ最新の run を API で探す
-      - name: Find latest nar-db-main
+      # run_id 未指定なら、nar-db-main のうち最大サイズのものを API で探す
+      - name: Find nar-db-main
         id: find
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -n "${{ github.event.inputs.run_id }}" ]; then
             echo "run_id=${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT
             echo "指定された run_id を使用: ${{ github.event.inputs.run_id }}"
             exit 0
           fi
-          RID=$(gh api -X GET \
-            "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
-            --jq '[.artifacts[] | select(.name=="nar-db-main" and .expired==false)]
-                  | sort_by(.created_at) | reverse | .[0].workflow_run.id')
-          if [ -z "$RID" ] || [ "$RID" = "null" ]; then
-            echo "!! nar-db-main が見つからない。先に Restore DB を実行すること"
+          API="repos/${{ github.repository }}/actions/artifacts?per_page=100"
+          JQ='.artifacts[] | select(.name=="nar-db-main" and .expired==false) | "\(.size_in_bytes)\t\(.workflow_run.id)\t\(.created_at)"'
+          gh api --paginate "$API" --jq "$JQ" | sort -rn > /tmp/arts.tsv
+          echo "=== nar-db-main の候補 (サイズ降順) ==="
+          echo "bytes | run_id | created_at"
+          cat /tmp/arts.tsv
+          if [ ! -s /tmp/arts.tsv ]; then
+            echo "!! nar-db-main が1件も無い。Restore DB を先に実行すること"
             exit 1
           fi
+          SIZE=$(head -1 /tmp/arts.tsv | cut -f1)
+          RID=$(head -1 /tmp/arts.tsv | cut -f2)
+          if [ "$SIZE" -lt 5000000 ]; then
+            echo "!! 最大でも ${SIZE} bytes。全部空DB。"
+            echo "   Restore DB (run_id=31826177392) で作り直すこと"
+            exit 1
+          fi
+          echo "採用: run_id=$RID (${SIZE} bytes)"
           echo "run_id=$RID" >> $GITHUB_OUTPUT
-          echo "最新の nar-db-main は run $RID"
 
       - uses: actions/download-artifact@v4
         with:
@@ -70,15 +85,21 @@ jobs:
           p = pathlib.Path("data/nar.db")
           if not p.exists():
               sys.exit("!! data/nar.db が無い")
+          mb = p.stat().st_size / 1024 / 1024
+          print(f"nar.db = {mb:,.1f} MB")
           c = sqlite3.connect(p)
+          for t in ("races", "entries", "results", "payouts"):
+              try:
+                  n = c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              except sqlite3.Error as e:
+                  sys.exit(f"!! {t} が読めない: {e}")
+              print(f"  {t:<10} {n:>9,}")
           n = c.execute("SELECT COUNT(*) FROM races").fetchone()[0]
-          print(f"races = {n:,}")
-          if n == 0:
-              sys.exit("!! DBが空")
+          if n < 1000:
+              sys.exit(f"!! races が {n} 件しかない。空DBを掴んでいる")
           EOF
 
       - name: Report
-        if: contains(github.event.inputs.mode, 'report') || github.event.inputs.mode == 'both'
         run: python -m nar.analyze --report
 
       - name: Calibrate
