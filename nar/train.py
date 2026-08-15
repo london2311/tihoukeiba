@@ -149,6 +149,22 @@ def main():
             print("  どの人気順位も回収率100%に届かない"
                   "(控除率18.8%を考えれば正常)")
 
+        print("\n" + "=" * 66)
+        print("■ 組み合わせ券種の効率性 (全レース。人気N-M-Lを毎回1点買う)")
+        ce = M.combination_efficiency(df, pmap0)
+        print(ce.to_string(index=False, float_format=lambda v: f"{v:.1f}"))
+        hot = ce[ce["95%下限"] > 100]
+        if len(hot):
+            print("\n  ★下限が100%超の組み合わせ★")
+            print(hot.to_string(index=False,
+                                float_format=lambda v: f"{v:.1f}"))
+        else:
+            near = ce[ce["回収率%"] > 90]
+            if len(near):
+                print("\n  下限100%超は無いが、回収率90%超は存在する:")
+                print(near.to_string(index=False,
+                                     float_format=lambda v: f"{v:.1f}"))
+
         for key in ("n_starters", "baba_code", "class_rank"):
             if key not in df:
                 continue
