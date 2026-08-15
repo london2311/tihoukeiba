@@ -1,0 +1,48 @@
+name: Restore DB
+
+# #3実行のシャードから nar-db-main を作り直す。
+# upload-artifact@v4 は同名を上書きできないため、
+# overwrite:true の付け忘れでアップロードが失敗し main が消えた。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'シャードを取り出す実行ID (例: 31826177392 = #3)'
+        required: true
+        default: '31826177392'
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # 指定した実行からシャードを回収する
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'shard-*'
+          path: shards/
+          merge-multiple: true
+          run-id: ${{ github.event.inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: What we got
+        run: ls -la shards/
+
+      - name: Merge
+        run: |
+          python -m nar.shards merge shards/*.db --out data/nar.db
+          python -m nar.backfill --report
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nar-db-main
+          path: data/nar.db
+          retention-days: 90
+          overwrite: true
