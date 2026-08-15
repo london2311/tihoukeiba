@@ -36,6 +36,9 @@ def main():
                          "学習末尾で当てたTは検証期で外れることが実測されている")
     ap.add_argument("--exact", action="store_true",
                     help="厳密な条件付きロジットを使う(既定は従来の近似)")
+    ap.add_argument("--with-market", action="store_true",
+                    help="市場の人気順位を特徴に入れる。"
+                         "『市場に勝つ』のではなく『市場を補正する』方針")
     a = ap.parse_args()
 
     # --- 貼り間違い検知 ---
@@ -77,6 +80,23 @@ def main():
     df = df[df["career_starts"] >= a.min_starts]
     print(f"  過去{a.min_starts}走以上に絞る: {before:,} -> {len(df):,}")
 
+    # -----------------------------------------------------------------
+    # 市場特徴
+    #   ★方針転換の選択肢★
+    #     独立モデルを作って市場と勝負するのが従来方針だったが、
+    #     実測でモデルの順位付けは市場に劣る(AUC 0.764 vs 0.816)。
+    #     EVに必要なのは「市場と独立であること」ではなく
+    #     「市場より正確であること」。人気順位は発走前に確定する
+    #     公開情報で、100%埋まっている。これを土台に置いて
+    #     自前の特徴で補正する方が、実務的には筋がよい。
+    #   ※ final_popularity は締切時点の確定値。締切直前に賭ける前提なら
+    #     使用は妥当だが、それより早く賭けるならズレる点に注意。
+    # -----------------------------------------------------------------
+    MARKET_COLS = ["mkt_rank", "mkt_logprob"]
+    df["mkt_rank"] = df["final_popularity"].astype(float)
+    df["mkt_logprob"] = np.log(
+        np.clip(M.market_prob_from_popularity(df), 1e-6, 1.0))
+
     # ---- 分割 ----
     odds_ok = df[df["final_win_odds"].notna()]
     if len(odds_ok) == 0:
@@ -90,8 +110,11 @@ def main():
     print(f"  検証 {len(te):,}出走 / {te['race_id'].nunique():,}レース"
           f"  ({str(te['race_date'].min())[:10]} .. {str(te['race_date'].max())[:10]})")
 
-    allc = [c for c in FT.BASE_COLS + FT.RANK_COLS if c in df.columns]
+    allc = [c for c in FT.BASE_COLS + FT.RANK_COLS + MARKET_COLS
+            if c in df.columns]
     cols = [c for c in FT.FEATURE_COLS if c in df.columns]
+    if a.with_market:
+        cols = cols + MARKET_COLS
     tr = tr.dropna(subset=["finish_pos"])
     te = te.dropna(subset=["finish_pos"])
     for d in (tr, te):
@@ -117,9 +140,12 @@ def main():
         both = [c for c in FT.BASE_COLS + FT.RANK_COLS if c in df.columns]
         rows = []
         variants = [("近似", M.ConditionalLogit), ("厳密", M.ConditionalLogitExact)]
+        sets = [("自前のみ", base), ("自前+順位", both),
+                ("自前+市場", base + MARKET_COLS),
+                ("市場のみ", MARKET_COLS)]
         for mname, klass in variants:
-            for label, cc in [("素のみ", base), ("素+順位", both)]:
-                for C in (0.1, 1.0, 10.0):
+            for label, cc in sets:
+                for C in (0.1, 1.0):
                     m = klass(C=C).fit(
                         tr, cc, calib_frac=0.15 if a.temp else 0.0)
                     p0 = m.predict_proba(te, raw=True)
