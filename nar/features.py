@@ -47,7 +47,7 @@ from . import raceclass as RC
 LEAK_COLS = {"finish_pos", "time_sec", "margin", "last_3f",
              "corner_1", "corner_2", "corner_3", "corner_4", "dnf_reason",
              # 下は当該レースの結果から作った中間量。lag 版だけを使う
-             "spd", "ag3fig"}
+             "spd", "ag3fig", "pacefig", "time_gap"}
 
 
 def load_frame(con: sqlite3.Connection, min_date: str | None = None) -> pd.DataFrame:
@@ -123,6 +123,12 @@ def add_speed_figure(df: pd.DataFrame) -> pd.DataFrame:
         [df["race_date"].values, df["baba_code"].values]).transform("median")
     df["ag3fig"] = -(dev3 - var3)
 
+    # --- 勝ち馬とのタイム差 (1km換算)。着順だけでは 2着0.1秒差 と
+    #     2着1.5秒差 が区別できない。★当該レース分は lag 版のみ使う★
+    win_t = df.groupby("race_id")["time_sec"].transform("min")
+    df["time_gap"] = ((df["time_sec"] - win_t)
+                      / (df["distance_m"] / 1000.0).replace(0, np.nan))
+
     # --- 前半の速さ = 全体の速さ - 末脚の速さ。脚質の代理指標 ---
     #     corner_4 が取れない以上、逃げ・追込はここから推定するしかない
     df["pacefig"] = df["spd"] - df["ag3fig"]
@@ -186,6 +192,46 @@ def add_past_form(df: pd.DataFrame, windows=(3, 5, 10)) -> pd.DataFrame:
     pc = g["pacefig"].shift(1)
     df["pacefig_avg5"] = _roll(pc, hid, 5, "mean")
 
+    # --- 着差の履歴 ---
+    tg = g["time_gap"].shift(1)
+    df["prev_time_gap"] = tg
+    df["gap_avg3"] = _roll(tg, hid, 3, "mean")
+    df["gap_best5"] = _roll(tg, hid, 5, "min")      # 小さいほど強い
+
+    # --- 乗り替わり・転入 ---
+    df["prev_jockey"] = g["jockey_name"].shift(1)
+    df["jockey_change"] = (
+        (df["jockey_name"] != df["prev_jockey"])
+        & df["prev_jockey"].notna()).astype(int)
+    df["prev_belong"] = g["transfer_from"].shift(1)
+    df["is_transfer"] = (
+        (df["transfer_from"] != df["prev_belong"])
+        & df["prev_belong"].notna()).astype(int)
+
+    # --- 当該場での実績 (輸送・コース形態への適性) ---
+    bk = df["horse_id"].astype(str) + "|" + df["baba_code"].astype(str)
+    top3 = (df["finish_pos"] <= 3).astype(float)
+    nb = df.groupby(bk, sort=False).cumcount()
+    cb = top3.groupby(bk).cumsum() - top3
+    p0 = float((1.0 / df["n_starters"].clip(lower=1)).mean())
+    df["baba_starts"] = nb
+    df["baba_top3_rate"] = (cb + 6.0 * 3 * p0) / (nb + 6.0)
+
+    # --- 道悪適性 (track_cond_num >= 3) ---
+    heavy = (df["track_cond_num"] >= 3)
+    hw = (top3 * heavy).astype(float)
+    hn = heavy.astype(float)
+    ch = hw.groupby(hid).cumsum() - hw
+    nh = hn.groupby(hid).cumsum() - hn
+    df["heavy_starts"] = nh
+    df["heavy_top3_rate"] = (ch + 5.0 * 3 * p0) / (nh + 5.0)
+
+    # --- 同距離帯での自己ベストスピード ---
+    band = (df["distance_m"] // 200 * 200).astype(str)
+    dk = df["horse_id"].astype(str) + "|" + band
+    df["dist_best_spd"] = (df.groupby(dk, sort=False)["spd"].shift(1)
+                             .groupby(dk).cummax())
+
     # --- 距離・場の経験 ---
     same_d = (g["distance_m"].shift(1) == df["distance_m"]).astype(float)
     df["dist_experience"] = _roll(same_d, hid, 10, "mean")
@@ -247,7 +293,15 @@ def add_person_form(df: pd.DataFrame) -> pd.DataFrame:
     d["jky_horse_rides"] = d.groupby(pair, sort=False).cumcount()
 
     new = [c for c in d.columns if c not in df.columns]
-    return df.join(d[new])
+    df = df.join(d[new])
+
+    # 乗り替わりの「質」。前走騎手より上手い騎手に乗り替わったか。
+    # 名前ベースで十分測れる (jockey_name は 99.8% 埋まっている)
+    t = df.sort_values(["horse_id", "race_date", "race_id"])
+    prev_rate = t.groupby("horse_id", sort=False)["jky_win_rate"].shift(1)
+    df["jky_rate_delta"] = (df["jky_win_rate"] - prev_rate.reindex(df.index))
+    df["jky_rate_delta"] = df["jky_rate_delta"].fillna(0.0)
+    return df
 
 
 # =====================================================================
@@ -257,7 +311,8 @@ def add_person_form(df: pd.DataFrame) -> pd.DataFrame:
 # =====================================================================
 REL_COLS = ["fin_avg5", "top3_rate5", "career_win_rate", "weight_carried",
             "spd_best5", "spd_avg5", "ag3fig_avg3", "pacefig_avg5",
-            "jky_win_rate", "jky_recent_win", "trn_win_rate", "days_rest"]
+            "jky_win_rate", "jky_recent_win", "trn_win_rate", "days_rest",
+            "gap_avg3", "gap_best5", "baba_top3_rate", "dist_best_spd"]
 
 
 def add_context_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -309,6 +364,13 @@ BASE_COLS = [
     # 騎手・調教師 (縮小済み)
     "jky_starts", "jky_win_rate", "jky_top3_rate", "jky_recent_win",
     "jky_horse_rides", "trn_win_rate", "trn_top3_rate",
+    # 着差 (着順だけでは負けの内容が分からない)
+    "prev_time_gap", "gap_avg3", "gap_best5",
+    # 乗り替わり・転入・適性
+    "jockey_change", "is_transfer", "jky_rate_delta",
+    "baba_starts", "baba_top3_rate",
+    "heavy_starts", "heavy_top3_rate",
+    "dist_best_spd",
     # 相手関係 (順位ではなく差。素と情報が重ならない)
     "spd_gap_to_top",
 ]
@@ -318,7 +380,8 @@ RANK_COLS = [
     "weight_carried_rank", "spd_best5_rank", "spd_avg5_rank",
     "ag3fig_avg3_rank", "pacefig_avg5_rank",
     "jky_win_rate_rank", "jky_recent_win_rank", "trn_win_rate_rank",
-    "days_rest_rank",
+    "days_rest_rank", "gap_avg3_rank", "gap_best5_rank",
+    "baba_top3_rate_rank", "dist_best_spd_rank",
 ]
 
 FEATURE_COLS = BASE_COLS
