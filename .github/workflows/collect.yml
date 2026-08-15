@@ -23,6 +23,10 @@ on:
     - cron: '0 17 * * *'
 
 concurrency: { group: nar-backfill, cancel-in-progress: false }
+
+permissions:
+  actions: read
+  contents: read
 env:
   SHARDS: 6
   TZ: Asia/Tokyo
@@ -116,9 +120,27 @@ jobs:
       - uses: actions/download-artifact@v4
         if: github.event.inputs.skip_seed != 'true'
         with: { name: nar-db-seed, path: data/ }
+      - name: Find main DB
+        id: prev
+        if: github.event.inputs.skip_seed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RID=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name=="nar-db-main" and .expired==false)]
+                  | sort_by(.created_at) | reverse | .[0].workflow_run.id')
+          if [ -z "$RID" ] || [ "$RID" = "null" ]; then
+            echo "!! nar-db-main が無い"; exit 1
+          fi
+          echo "run_id=$RID" >> $GITHUB_OUTPUT
       - uses: actions/download-artifact@v4
         if: github.event.inputs.skip_seed == 'true'
-        with: { name: nar-db-main, path: data/ }
+        with:
+          name: nar-db-main
+          path: data/
+          run-id: ${{ steps.prev.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify DB is not empty
         run: |

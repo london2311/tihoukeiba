@@ -1,5 +1,10 @@
 name: Analyze
 
+# ★download-artifact の落とし穴★
+#   既定では「同じ run 内」のアーティファクトしか見えない。
+#   別 run が作った nar-db-main を取るには run-id と github-token が要る。
+#   run-id を省略すると自分の run を見にいって "Artifact not found" になる。
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,6 +12,14 @@ on:
         description: 'report / calibrate / both'
         required: true
         default: 'both'
+      run_id:
+        description: 'nar-db-main を作った実行ID (空なら最新を自動検索)'
+        required: false
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
 
 jobs:
   analyze:
@@ -19,13 +32,55 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
+
+      # run_id 未指定なら、nar-db-main を持つ最新の run を API で探す
+      - name: Find latest nar-db-main
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.run_id }}" ]; then
+            echo "run_id=${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT
+            echo "指定された run_id を使用: ${{ github.event.inputs.run_id }}"
+            exit 0
+          fi
+          RID=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name=="nar-db-main" and .expired==false)]
+                  | sort_by(.created_at) | reverse | .[0].workflow_run.id')
+          if [ -z "$RID" ] || [ "$RID" = "null" ]; then
+            echo "!! nar-db-main が見つからない。先に Restore DB を実行すること"
+            exit 1
+          fi
+          echo "run_id=$RID" >> $GITHUB_OUTPUT
+          echo "最新の nar-db-main は run $RID"
+
       - uses: actions/download-artifact@v4
         with:
           name: nar-db-main
           path: data/
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify DB
+        run: |
+          ls -la data/
+          python - <<'EOF'
+          import sqlite3, sys, pathlib
+          p = pathlib.Path("data/nar.db")
+          if not p.exists():
+              sys.exit("!! data/nar.db が無い")
+          c = sqlite3.connect(p)
+          n = c.execute("SELECT COUNT(*) FROM races").fetchone()[0]
+          print(f"races = {n:,}")
+          if n == 0:
+              sys.exit("!! DBが空")
+          EOF
+
       - name: Report
         if: contains(github.event.inputs.mode, 'report') || github.event.inputs.mode == 'both'
         run: python -m nar.analyze --report
+
       - name: Calibrate
         if: contains(github.event.inputs.mode, 'calibrate') || github.event.inputs.mode == 'both'
         run: python -m nar.analyze --calibrate
