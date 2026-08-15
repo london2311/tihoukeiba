@@ -1,214 +1,363 @@
-# ===== nar/train.py     (学習・検証の実行スクリプト) =====
+# ===== nar/model.py     (条件付きロジット + 温度較正 + EV) =====
 """
-学習と検証の実行。
+着順確率モデル — 条件付きロジット (Plackett-Luce の1着部分)。
 
-    python -m nar.train
+設計:
+  各馬 i に強さスコア s_i を出し、レース内でソフトマックスして勝率にする。
+      P(i が1着) = exp(s_i) / Σ_j exp(s_j)
+  レース単位で確率が1に合うので EV 計算にそのまま使える。
+  木モデルより素直で、地方の薄いサンプルでも壊れにくい。
 
-流れ:
-  1) 16万出走から特徴量を作る (features.py, リーク防止済み)
-  2) 時系列分割で学習
-  3) 市場ベースラインと比較        ← ここが実質の合否判定
-  4) キャリブレーション確認
-  5) オッズ完備レースだけで単勝EVバックテスト
+学習と検証の分離 (これを間違えると全部無意味になる):
+  学習   … 全16万出走。オッズは不要
+  検証   … オッズ完備レースのみ。実オッズだけを使い推定値は混ぜない
+  分割   … 必ず時系列。ランダム分割は禁止
+
+合否判定:
+  最終的に見るのは「市場(人気順)より賢いか」の一点。
+  控除率18.8%を超える精度差が無ければ EV100%超は原理的に成立しない。
 """
 from __future__ import annotations
 
-import argparse
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize_scalar
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, log_loss
 
-from .core import connect
-from . import features as FT
-from . import model as M
+
+def softmax_by_race(df: pd.DataFrame, s: np.ndarray) -> np.ndarray:
+    """レース内ソフトマックス。ベクトル化してあるので大きいデータでも速い。"""
+    t = pd.DataFrame({"r": df["race_id"].values, "s": s})
+    m = t.groupby("r")["s"].transform("max")
+    e = np.exp(t["s"] - m)
+    return (e / e.groupby(t["r"]).transform("sum")).values
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cutoff", default=None,
-                    help="学習/検証の境界日。既定はオッズ完備の開始日")
-    ap.add_argument("--C", type=float, default=1.0)
-    ap.add_argument("--min-starts", type=int, default=3,
-                    help="過去N走未満の馬を学習から除く")
-    ap.add_argument("--sweep", action="store_true",
-                    help="正則化と特徴集合を総当たりして比較表を出す")
-    ap.add_argument("--no-temp", action="store_true",
-                    help="温度較正を無効にする")
-    ap.add_argument("--exact", action="store_true",
-                    help="厳密な条件付きロジットを使う(既定は従来の近似)")
-    a = ap.parse_args()
+# =====================================================================
+# 学習
+# =====================================================================
+class ConditionalLogit:
+    """
+    レース内で相対化した特徴を使うロジスティック回帰。
 
-    # --- 貼り間違い検知 ---
-    #   ブラウザUIで作業しているとファイルの中身を取り違えることがある。
-    #   実際に features.py / model.py が train.py の複製になった事故があった。
-    #   分かりにくい AttributeError で落ちる前に、ここで止める。
-    import sys
-    for mod, attr, need in [(FT, "BASE_COLS", "nar/features.py"),
-                            (FT, "add_speed_figure", "nar/features.py"),
-                            (M, "ConditionalLogit", "nar/model.py")]:
-        if not hasattr(mod, attr):
-            sys.exit(f"!! {need} の中身が想定と違う ({attr} が無い)。\n"
-                     f"   ファイルの貼り間違いを確認すること。\n"
-                     f"   各ファイルの1行目に '# ===== nar/xxx.py' のマーカーがある。")
-    if not hasattr(M.ConditionalLogit(), "temperature"):
-        sys.exit("!! nar/model.py が古い (温度較正が入っていない)")
+    条件付きロジットの厳密推定は重いので、
+      ① 特徴をレース内で標準化(z化)する
+      ② 1着かどうかの二値ロジスティックを解く
+      ③ 予測時にレース内ソフトマックスで正規化する
+    という近似を使う。実務上ほぼ同等で、はるかに速く安定する。
+    """
 
-    con = connect()
+    def __init__(self, C: float = 1.0):
+        self.C = C
+        self.scaler = StandardScaler()
+        self.clf = LogisticRegression(
+            C=C, max_iter=2000, solver="lbfgs", class_weight=None)
+        self.cols: list[str] = []
+        self.temperature: float = 1.0
+        self.calib_cut: str | None = None
 
-    print("=" * 66)
-    print("■ 特徴量生成")
-    df = FT.build(con)
-    FT.assert_no_leak(df)
-    # ★レース内 z化で消える特徴を検出する★
-    #   この模型はレース内で相対化するので、レース内定数は学習に寄与しない。
-    #   「40特徴あるつもりで実は24」という事故を機械的に防ぐ。
-    FT.assert_varies_within_race(df)
-    FT.coverage_report(df)
-    print(f"  {len(df):,}出走 / {df['race_id'].nunique():,}レース")
+    @staticmethod
+    def _within_race(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+        """
+        レース内 z化。★これが条件付きロジットの肝★
+        絶対値ではなく「同じレースの他馬と比べてどうか」だけを見る。
+        レース間の水準差(クラス・時期・場)が自動的に落ちる。
+        """
+        g = df.groupby("race_id")[cols]
+        mu = g.transform("mean")
+        sd = g.transform("std").replace(0, np.nan)
+        z = (df[cols] - mu) / sd
+        return z.fillna(0.0)
 
-    # クラス復元の効き具合 (race_name から作り直したもの)
-    if "class_rank" in df:
-        ok = df["class_rank"].notna().mean() * 100
-        mv = df["class_move"].notna().mean() * 100
-        print(f"  class_rank 充足 {ok:5.1f}%  /  class_move 充足 {mv:5.1f}%")
+    def fit(self, df: pd.DataFrame, cols: list[str],
+            calib_frac: float = 0.15) -> "ConditionalLogit":
+        """
+        calib_frac > 0 なら、学習データの★時系列で後ろ側★を温度較正に使う。
+        ランダムに切ると未来を見てしまうので必ず日付順の末尾を取る。
+        """
+        self.cols = cols
+        fit_df, cal_df = df, df.iloc[:0]
+        if calib_frac > 0:
+            dates = df["race_date"].drop_duplicates().sort_values()
+            cut = dates.iloc[int(len(dates) * (1 - calib_frac))]
+            a = df[df["race_date"] < cut]
+            b = df[df["race_date"] >= cut]
+            if len(a) >= 5000 and len(b) >= 2000:
+                fit_df, cal_df = a, b
+                self.calib_cut = str(cut)[:10]
 
-    # 過去走が薄い馬は除く(特徴が全部NaNなのでノイズにしかならない)
-    before = len(df)
-    df = df[df["career_starts"] >= a.min_starts]
-    print(f"  過去{a.min_starts}走以上に絞る: {before:,} -> {len(df):,}")
+        X = self._within_race(fit_df, cols)
+        X = self.scaler.fit_transform(X.values)
+        y = (fit_df["finish_pos"] == 1).astype(int).values
+        self.clf.fit(X, y)
 
-    # ---- 分割 ----
-    odds_ok = df[df["final_win_odds"].notna()]
-    if len(odds_ok) == 0:
-        print("!! オッズがある行が無い。バックテストできない")
-        return
-    cutoff = a.cutoff or str(odds_ok["race_date"].min())[:10]
-    tr, te = M.time_split(df, cutoff)
-    print(f"\n■ 時系列分割 (cutoff={cutoff})")
-    print(f"  学習 {len(tr):,}出走 / {tr['race_id'].nunique():,}レース"
-          f"  ({str(tr['race_date'].min())[:10]} .. {str(tr['race_date'].max())[:10]})")
-    print(f"  検証 {len(te):,}出走 / {te['race_id'].nunique():,}レース"
-          f"  ({str(te['race_date'].min())[:10]} .. {str(te['race_date'].max())[:10]})")
-
-    allc = [c for c in FT.BASE_COLS + FT.RANK_COLS if c in df.columns]
-    cols = [c for c in FT.FEATURE_COLS if c in df.columns]
-    tr = tr.dropna(subset=["finish_pos"])
-    te = te.dropna(subset=["finish_pos"])
-    for d in (tr, te):
-        d[allc] = d[allc].fillna(0.0)
-
-    y_te0 = (te["finish_pos"] == 1).astype(int).values
-    p_pop0 = M.market_prob_from_popularity(te)
-    sub0 = te[te["final_win_odds"].notna()].copy()
-    idx0 = te["final_win_odds"].notna().values
-    ll_mkt = np.nan
-    if len(sub0):
-        ll_mkt = M.evaluate("市場", y_te0[idx0],
-                            M.market_prob_from_odds(sub0),
-                            sub0["race_id"])["logloss"]
+        if len(cal_df):
+            self.temperature = self._fit_temperature(cal_df)
+        return self
 
     # -----------------------------------------------------------------
-    # 総当たり: 正則化 x 特徴集合
-    #   ★順位特徴を入れるべきか、正則化をどこまで効かせるかは
-    #     理屈では決まらない。1回の実行で全部測って選ぶ★
+    # 温度較正
+    #   softmax は尖りすぎることがある。実測では最上位ビンで
+    #   予測47.2% に対し実現24.9% だった。EV = p x odds なので
+    #   ここがズレていると EV の数字は全部嘘になる。
+    #   スカラー1個 T を入れて softmax(s/T) の対数尤度を最大化する。
     # -----------------------------------------------------------------
-    if a.sweep:
-        base = [c for c in FT.BASE_COLS if c in df.columns]
-        both = [c for c in FT.BASE_COLS + FT.RANK_COLS if c in df.columns]
-        rows = []
-        variants = [("近似", M.ConditionalLogit), ("厳密", M.ConditionalLogitExact)]
-        for mname, klass in variants:
-            for label, cc in [("素のみ", base), ("素+順位", both)]:
-                for C in (0.1, 1.0, 10.0):
-                    m = klass(C=C).fit(
-                        tr, cc, calib_frac=0.0 if a.no_temp else 0.15)
-                    p = m.predict_proba(te)
-                    ev = M.evaluate("x", y_te0, p, te["race_id"])
-                    ct = M.calibration_table(y_te0, p)
-                    ct0 = M.calibration_table(
-                        y_te0, m.predict_proba(te, raw=True))
-                    rows.append({
-                        "模型": mname,
-                        "特徴": f"{label}({len(cc)})", "C": C,
-                        "T": m.temperature,
-                        "logloss": ev["logloss"], "auc": ev["auc"],
-                        "top1%": ev["top1_hit"] * 100,
-                        "較正前乖離": ct0["diff"].abs().max(),
-                        "較正後乖離": ct["diff"].abs().max(),
-                        "vs市場": ev["logloss"] - ll_mkt,
-                    })
-        r = pd.DataFrame(rows).sort_values("logloss")
-        print("\n■ 総当たり (logloss昇順。vs市場が負ならモデルの勝ち)")
-        print(r.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-        best = r.iloc[0]
-        print(f"\n  最良: {best['模型']} / {best['特徴']} C={best['C']}  "
-              f"logloss {best['logloss']:.4f}  (市場 {ll_mkt:.4f})")
-        return
+    def _fit_temperature(self, df: pd.DataFrame) -> float:
+        s = self.score(df)
+        y = (df["finish_pos"] == 1).astype(int).values
+        rid = df["race_id"]
 
-    # ---- 学習 ----
-    print(f"\n■ 学習 ({len(cols)}特徴)")
-    klass = M.ConditionalLogitExact if a.exact else M.ConditionalLogit
-    print(f"  模型: {'厳密な条件付きロジット' if a.exact else '近似(レース内z化+二値)'}")
-    m = klass(C=a.C).fit(tr, cols, calib_frac=0.0 if a.no_temp else 0.15)
-    print(m.coef_table().head(12).to_string(index=False))
-    if m.calib_cut:
-        print(f"\n  温度較正 T={m.temperature:.3f} "
-              f"(学習内の {m.calib_cut} 以降で推定)")
-        print("    T>1 は予測が尖りすぎていたことを意味する")
+        def nll(logT: float) -> float:
+            p = softmax_by_race(df, s / np.exp(logT))
+            p = np.clip(p, 1e-12, 1.0)
+            return -np.log(p[y == 1]).sum() / max(y.sum(), 1)
 
-    # ---- 評価 ----
-    y_te = (te["finish_pos"] == 1).astype(int).values
-    p_model = m.predict_proba(te)
-    p_pop = M.market_prob_from_popularity(te)
+        r = minimize_scalar(nll, bounds=(np.log(0.3), np.log(6.0)),
+                            method="bounded")
+        return float(np.exp(r.x))
 
-    print("\n■ 検証 (全検証レース)")
-    rows = [M.evaluate("model", y_te, p_model, te["race_id"]),
-            M.evaluate("市場(人気順)", y_te, p_pop, te["race_id"])]
+    def score(self, df: pd.DataFrame) -> np.ndarray:
+        X = self._within_race(df, self.cols)
+        X = self.scaler.transform(X.values)
+        return self.clf.decision_function(X)
 
-    sub = te[te["final_win_odds"].notna()].copy()
-    if len(sub):
-        idx = te["final_win_odds"].notna().values
-        p_odds = M.market_prob_from_odds(sub)
-        rows.append(M.evaluate("市場(実オッズ)", y_te[idx], p_odds,
-                               sub["race_id"]))
-    r = pd.DataFrame(rows)
-    print(r.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    def predict_proba(self, df: pd.DataFrame, raw: bool = False) -> np.ndarray:
+        """レース内ソフトマックス。レースごとに合計1になる。
+        raw=True で温度較正を外した生の確率を返す(較正の効果測定用)。"""
+        t = 1.0 if raw else self.temperature
+        return softmax_by_race(df, self.score(df) / t)
 
-    ll_m = r.loc[r["name"] == "model", "logloss"].iloc[0]
-    ll_k = r.loc[r["name"].str.contains("実オッズ"), "logloss"]
-    print("\n  判定:")
-    if len(ll_k) and ll_m < ll_k.iloc[0]:
-        print(f"    モデルが市場を上回っている "
-              f"(logloss {ll_m:.4f} < {ll_k.iloc[0]:.4f})")
-    elif len(ll_k):
-        print(f"    ★モデルは市場に負けている "
-              f"(logloss {ll_m:.4f} >= {ll_k.iloc[0]:.4f})")
-        print("     この状態でEVがプラスに見えても、それは偶然かリーク。")
-
-    # ---- キャリブレーション ----
-    print("\n■ キャリブレーション (予測確率 vs 実現率)")
-    if m.temperature != 1.0:
-        ct0 = M.calibration_table(y_te, m.predict_proba(te, raw=True))
-        print(f"  較正前の最大乖離 {ct0['diff'].abs().max():.4f}"
-              f"  → 較正後 {M.calibration_table(y_te, p_model)['diff'].abs().max():.4f}")
-    ct = M.calibration_table(y_te, p_model)
-    print(ct.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-    md = ct["diff"].abs().max()
-    print(f"  最大乖離 {md:.4f}  "
-          f"{'(良好)' if md < 0.03 else '(!! ズレが大きい。EVは信用できない)'}")
-
-    # ---- EVバックテスト ----
-    print("\n■ 単勝EVバックテスト (実オッズのみ)")
-    if len(sub) == 0:
-        print("  検証区間にオッズ完備レースが無い")
-        return
-    p_sub = m.predict_proba(sub)
-    bt = M.backtest_win(sub, p_sub)
-    bt["EV閾値"] = bt["EV閾値"].map(lambda v: f"{v:.2f}")
-    print(bt.to_string(index=False, float_format=lambda v: f"{v:.1f}"))
-
-    print("\n  ※ 回収率の点推定ではなく95%区間の下限を見ること。")
-    print("     下限が100%を割るなら、それは『勝てる』とは言えない。")
+    def coef_table(self) -> pd.DataFrame:
+        return (pd.DataFrame({"feature": self.cols,
+                              "coef": self.clf.coef_[0]})
+                .assign(abs_coef=lambda d: d["coef"].abs())
+                .sort_values("abs_coef", ascending=False)
+                .drop(columns="abs_coef"))
 
 
-if __name__ == "__main__":
-    main()
+# =====================================================================
+# 厳密な条件付きロジット (Plackett-Luce の1着部分)
+#
+# ★上の ConditionalLogit との違い★
+#   上は「レース内z化 → 二値ロジスティック → 予測時にsoftmax」という近似。
+#   これには2つの副作用がある:
+#
+#   (1) 二値ロジスティックが最適化しているのは
+#       「この馬は勝つか」であって「レースの中で誰が勝つか」ではない。
+#       係数の尺度が softmax 用に較正されないので、確率が尖りすぎる。
+#
+#   (2) レース内 std で割ると、レースごとの「差の大きさ」が消える。
+#       抜けた1頭がいるレースも横一線のレースも同じ尺度に潰れるので、
+#       自信を持つべき場面と持つべきでない場面の区別がつかなくなる。
+#       2026-08-15 の実測でキャリブレーション最大乖離 0.20
+#       (予測47% vs 実現25%) が残ったのはこれが原因の可能性が高い。
+#
+#   ここでは尤度を直接最大化する:
+#       NLL = -Σ_race [ x_win·β - logΣ_j exp(x_j·β) ] + λ|β|²
+#   レース内の差だけが効くので、レース単位の定数は自動的に落ちる。
+#   標準化は全体で行い、レース内では中心化のみ(数値安定のため)。
+# =====================================================================
+class ConditionalLogitExact:
+
+    def __init__(self, C: float = 1.0, center: bool = True):
+        self.C = C
+        self.center = center
+        self.scaler = StandardScaler()
+        self.cols: list[str] = []
+        self.beta: np.ndarray | None = None
+        self.temperature: float = 1.0
+        self.calib_cut: str | None = None
+        self.n_iter_: int = 0
+
+    def _design(self, df: pd.DataFrame, fit: bool = False) -> np.ndarray:
+        X = df[self.cols].astype(float).fillna(0.0).values
+        X = self.scaler.fit_transform(X) if fit else self.scaler.transform(X)
+        if self.center:
+            # レース内で中心化。softmax では定数が消えるので情報は失わない。
+            # ★std で割らないのが上との決定的な違い★
+            t = pd.DataFrame(X, index=df.index)
+            X = (t - t.groupby(df["race_id"].values).transform("mean")).values
+        return np.nan_to_num(X)
+
+    @staticmethod
+    def _group_index(rid: pd.Series) -> np.ndarray:
+        codes, _ = pd.factorize(rid.values)
+        return codes
+
+    def fit(self, df: pd.DataFrame, cols: list[str],
+            calib_frac: float = 0.15) -> "ConditionalLogitExact":
+        self.cols = cols
+        fit_df, cal_df = df, df.iloc[:0]
+        if calib_frac > 0:
+            dates = df["race_date"].drop_duplicates().sort_values()
+            cut = dates.iloc[int(len(dates) * (1 - calib_frac))]
+            a, b = df[df["race_date"] < cut], df[df["race_date"] >= cut]
+            if len(a) >= 5000 and len(b) >= 2000:
+                fit_df, cal_df = a, b
+                self.calib_cut = str(cut)[:10]
+
+        X = self._design(fit_df, fit=True)
+        g = self._group_index(fit_df["race_id"])
+        y = (fit_df["finish_pos"] == 1).astype(int).values.astype(bool)
+        ng = g.max() + 1
+        lam = 1.0 / (2.0 * self.C * max(ng, 1))
+
+        Xw = np.zeros((ng, X.shape[1]))
+        np.add.at(Xw, g[y], X[y])          # レースごとの勝ち馬の特徴
+
+        def obj(beta):
+            s = X @ beta
+            m = np.full(ng, -np.inf)
+            np.maximum.at(m, g, s)
+            e = np.exp(s - m[g])
+            Z = np.bincount(g, weights=e, minlength=ng)
+            lse = m + np.log(Z)
+            nll = float(-(Xw @ beta).sum() + lse.sum()) / ng \
+                + lam * float(beta @ beta)
+            p = e / Z[g]
+            Xp = np.zeros_like(Xw)
+            np.add.at(Xp, g, X * p[:, None])
+            grad = -(Xw.sum(0) - Xp.sum(0)) / ng + 2 * lam * beta
+            return nll, grad
+
+        from scipy.optimize import minimize
+        r = minimize(obj, np.zeros(X.shape[1]), jac=True, method="L-BFGS-B",
+                     options={"maxiter": 500})
+        self.beta = r.x
+        self.n_iter_ = int(r.nit)
+
+        if len(cal_df):
+            self.temperature = self._fit_temperature(cal_df)
+        return self
+
+    def score(self, df: pd.DataFrame) -> np.ndarray:
+        return self._design(df) @ self.beta
+
+    def _fit_temperature(self, df: pd.DataFrame) -> float:
+        s = self.score(df)
+        y = (df["finish_pos"] == 1).astype(int).values
+
+        def nll(logT):
+            p = np.clip(softmax_by_race(df, s / np.exp(logT)), 1e-12, 1.0)
+            return -np.log(p[y == 1]).sum() / max(y.sum(), 1)
+
+        r = minimize_scalar(nll, bounds=(np.log(0.3), np.log(6.0)),
+                            method="bounded")
+        return float(np.exp(r.x))
+
+    def predict_proba(self, df: pd.DataFrame, raw: bool = False) -> np.ndarray:
+        t = 1.0 if raw else self.temperature
+        return softmax_by_race(df, self.score(df) / t)
+
+    def coef_table(self) -> pd.DataFrame:
+        return (pd.DataFrame({"feature": self.cols, "coef": self.beta})
+                .assign(a=lambda d: d["coef"].abs())
+                .sort_values("a", ascending=False).drop(columns="a"))
+
+
+# =====================================================================
+# 市場ベースライン
+# =====================================================================
+def market_prob_from_popularity(df: pd.DataFrame) -> np.ndarray:
+    """
+    人気順位だけから作る素朴な市場確率。
+    「人気順位 -> 勝率」の実測平均を頭数別に当てはめる。
+    モデルはこれを上回れなければ意味がない。
+    """
+    t = df[["race_id", "n_starters", "final_popularity"]].copy()
+    t["w"] = 1.0 / t["final_popularity"].clip(lower=1)
+    tot = t.groupby("race_id")["w"].transform("sum")
+    return (t["w"] / tot).values
+
+
+def market_prob_from_odds(df: pd.DataFrame) -> np.ndarray:
+    """実オッズから控除率を戻した市場確率。オッズ完備レースでのみ使える。"""
+    inv = 1.0 / df["final_win_odds"].replace(0, np.nan)
+    tot = inv.groupby(df["race_id"]).transform("sum")
+    return (inv / tot).values
+
+
+# =====================================================================
+# 評価
+# =====================================================================
+def evaluate(name: str, y: np.ndarray, p: np.ndarray,
+             race_id: pd.Series) -> dict:
+    p = np.clip(p, 1e-9, 1 - 1e-9)
+    d = {
+        "name": name,
+        "n": len(y),
+        "logloss": log_loss(y, p, labels=[0, 1]),
+        "auc": roc_auc_score(y, p) if len(np.unique(y)) > 1 else np.nan,
+    }
+    # レース単位の的中率: 最高確率の馬が実際に1着か
+    t = pd.DataFrame({"r": race_id.values, "p": p, "y": y})
+    top = t.loc[t.groupby("r")["p"].idxmax()]
+    d["top1_hit"] = top["y"].mean()
+    return d
+
+
+def calibration_table(y: np.ndarray, p: np.ndarray, bins=10) -> pd.DataFrame:
+    """
+    予測確率とその実現率の対応。★EVの前提はここが合っていること★
+    「15%と言った馬が本当に15%勝つ」が崩れていたら、EVの数字は全部嘘になる。
+    """
+    q = pd.qcut(p, bins, duplicates="drop")
+    t = pd.DataFrame({"p": p, "y": y, "bin": q})
+    g = t.groupby("bin", observed=True).agg(
+        n=("y", "size"), pred=("p", "mean"), actual=("y", "mean"))
+    g["diff"] = g["actual"] - g["pred"]
+    return g.reset_index(drop=True)
+
+
+# =====================================================================
+# EV バックテスト (単勝・実オッズのみ)
+# =====================================================================
+def backtest_win(df: pd.DataFrame, p: np.ndarray,
+                 ev_thresholds=(1.00, 1.05, 1.10, 1.20, 1.50),
+                 stake: float = 100.0) -> pd.DataFrame:
+    """
+    EV = p * odds。閾値を超えた買い目だけ単勝を1点買いする。
+
+    ★実オッズがある行だけを対象にすること★
+    推定オッズを混ぜた瞬間にバックテストは信用できなくなる。
+    """
+    d = df.copy()
+    d["p"] = p
+    d = d[d["final_win_odds"].notna() & (d["final_win_odds"] > 0)]
+    d["ev"] = d["p"] * d["final_win_odds"]
+    d["hit"] = (d["finish_pos"] == 1).astype(int)
+    d["ret"] = d["hit"] * d["final_win_odds"] * stake
+
+    rows = []
+    for th in ev_thresholds:
+        s = d[d["ev"] >= th]
+        if len(s) == 0:
+            rows.append({"EV閾値": th, "点数": 0})
+            continue
+        bet = len(s) * stake
+        ret = s["ret"].sum()
+        # ブートストラップで回収率の95%区間を出す(点推定だけ見ると事故る)
+        rng = np.random.default_rng(0)
+        boots = [
+            s["ret"].values[rng.integers(0, len(s), len(s))].sum() / bet
+            for _ in range(400)
+        ] if len(s) >= 30 else []
+        rows.append({
+            "EV閾値": th,
+            "点数": len(s),
+            "的中": int(s["hit"].sum()),
+            "的中率%": s["hit"].mean() * 100,
+            "回収率%": ret / bet * 100,
+            "95%下限": np.percentile(boots, 2.5) * 100 if boots else np.nan,
+            "95%上限": np.percentile(boots, 97.5) * 100 if boots else np.nan,
+            "平均オッズ": s["final_win_odds"].mean(),
+        })
+    return pd.DataFrame(rows)
+
+
+def time_split(df: pd.DataFrame, cutoff: str):
+    tr = df[df["race_date"] < cutoff].copy()
+    te = df[df["race_date"] >= cutoff].copy()
+    return tr, te
