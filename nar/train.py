@@ -33,6 +33,8 @@ def main():
                     help="正則化と特徴集合を総当たりして比較表を出す")
     ap.add_argument("--no-temp", action="store_true",
                     help="温度較正を無効にする")
+    ap.add_argument("--exact", action="store_true",
+                    help="厳密な条件付きロジットを使う(既定は従来の近似)")
     a = ap.parse_args()
 
     # --- 貼り間違い検知 ---
@@ -113,32 +115,40 @@ def main():
         base = [c for c in FT.BASE_COLS if c in df.columns]
         both = [c for c in FT.BASE_COLS + FT.RANK_COLS if c in df.columns]
         rows = []
-        for label, cc in [("素のみ", base), ("素+順位", both)]:
-            for C in (0.03, 0.1, 0.3, 1.0, 3.0):
-                m = M.ConditionalLogit(C=C).fit(
-                    tr, cc, calib_frac=0.0 if a.no_temp else 0.15)
-                p = m.predict_proba(te)
-                ev = M.evaluate("x", y_te0, p, te["race_id"])
-                ct = M.calibration_table(y_te0, p)
-                rows.append({
-                    "特徴": f"{label}({len(cc)})", "C": C, "T": m.temperature,
-                    "logloss": ev["logloss"], "auc": ev["auc"],
-                    "top1%": ev["top1_hit"] * 100,
-                    "較正最大乖離": ct["diff"].abs().max(),
-                    "vs市場": ev["logloss"] - ll_mkt,
-                })
+        variants = [("近似", M.ConditionalLogit), ("厳密", M.ConditionalLogitExact)]
+        for mname, klass in variants:
+            for label, cc in [("素のみ", base), ("素+順位", both)]:
+                for C in (0.1, 1.0, 10.0):
+                    m = klass(C=C).fit(
+                        tr, cc, calib_frac=0.0 if a.no_temp else 0.15)
+                    p = m.predict_proba(te)
+                    ev = M.evaluate("x", y_te0, p, te["race_id"])
+                    ct = M.calibration_table(y_te0, p)
+                    ct0 = M.calibration_table(
+                        y_te0, m.predict_proba(te, raw=True))
+                    rows.append({
+                        "模型": mname,
+                        "特徴": f"{label}({len(cc)})", "C": C,
+                        "T": m.temperature,
+                        "logloss": ev["logloss"], "auc": ev["auc"],
+                        "top1%": ev["top1_hit"] * 100,
+                        "較正前乖離": ct0["diff"].abs().max(),
+                        "較正後乖離": ct["diff"].abs().max(),
+                        "vs市場": ev["logloss"] - ll_mkt,
+                    })
         r = pd.DataFrame(rows).sort_values("logloss")
         print("\n■ 総当たり (logloss昇順。vs市場が負ならモデルの勝ち)")
         print(r.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
         best = r.iloc[0]
-        print(f"\n  最良: {best['特徴']} C={best['C']}  "
+        print(f"\n  最良: {best['模型']} / {best['特徴']} C={best['C']}  "
               f"logloss {best['logloss']:.4f}  (市場 {ll_mkt:.4f})")
         return
 
     # ---- 学習 ----
     print(f"\n■ 学習 ({len(cols)}特徴)")
-    m = M.ConditionalLogit(C=a.C).fit(
-        tr, cols, calib_frac=0.0 if a.no_temp else 0.15)
+    klass = M.ConditionalLogitExact if a.exact else M.ConditionalLogit
+    print(f"  模型: {'厳密な条件付きロジット' if a.exact else '近似(レース内z化+二値)'}")
+    m = klass(C=a.C).fit(tr, cols, calib_frac=0.0 if a.no_temp else 0.15)
     print(m.coef_table().head(12).to_string(index=False))
     if m.calib_cut:
         print(f"\n  温度較正 T={m.temperature:.3f} "
