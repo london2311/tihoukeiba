@@ -1,0 +1,78 @@
+name: Train
+
+on:
+  workflow_dispatch:
+    inputs:
+      cutoff:
+        description: '学習/検証の境界日 (空ならオッズ完備開始日)'
+        required: false
+        default: ''
+      C:
+        description: '正則化 (小さいほど強い)'
+        required: false
+        default: '1.0'
+      min_starts:
+        description: '過去N走未満の馬を除く'
+        required: false
+        default: '3'
+      run_id:
+        description: 'nar-db-main の実行ID (空なら最新を自動検索)'
+        required: false
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Find DB
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.run_id }}" ]; then
+            echo "run_id=${{ github.event.inputs.run_id }}" >> $GITHUB_OUTPUT; exit 0
+          fi
+          RID=$(gh api -X GET \
+            "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name=="nar-db-main" and .expired==false)]
+                  | sort_by(.size_in_bytes) | reverse | .[0].workflow_run.id')
+          [ -z "$RID" ] || [ "$RID" = "null" ] && { echo "!! nar-db-main が無い"; exit 1; }
+          echo "run_id=$RID" >> $GITHUB_OUTPUT
+          echo "使用する run: $RID"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nar-db-main
+          path: data/
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify
+        run: |
+          python - <<'EOF'
+          import sqlite3, sys
+          c = sqlite3.connect("data/nar.db")
+          n = c.execute("SELECT COUNT(*) FROM races").fetchone()[0]
+          o = c.execute("SELECT COUNT(*) FROM results WHERE final_win_odds IS NOT NULL").fetchone()[0]
+          print(f"races={n:,} odds={o:,}")
+          if n == 0: sys.exit("!! DBが空")
+          EOF
+
+      - name: Train
+        run: |
+          python -m nar.train \
+            ${{ github.event.inputs.cutoff && format('--cutoff {0}', github.event.inputs.cutoff) || '' }} \
+            --C ${{ github.event.inputs.C || '1.0' }} \
+            --min-starts ${{ github.event.inputs.min_starts || '3' }}
