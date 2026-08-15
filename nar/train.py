@@ -125,6 +125,39 @@ def main():
     df["mkt_logprob"] = np.log(
         np.clip(M.market_prob_from_popularity(df), 1e-6, 1.0))
 
+    # -----------------------------------------------------------------
+    # ★モデルの前に、市場そのものの効率性を測る★
+    #   どの区分でも回収率が控除率なりに沈んでいるなら、
+    #   その券種で勝つ前提自体を見直す必要がある。
+    #   人気順位は100%埋まっているので全レースで測れる。
+    # -----------------------------------------------------------------
+    if not a.sweep:
+        pmap0 = M.load_payout_map(con)
+        print("\n" + "=" * 66)
+        print("■ 市場効率マップ (全レース。N番人気を毎回買う戦略)")
+        me = M.market_efficiency(df, pmap0)
+        for bt, g in me.groupby("券種"):
+            print(f"\n  [{bt}]")
+            print(g.drop(columns="券種").to_string(
+                index=False, float_format=lambda v: f"{v:.1f}"))
+        best = me.sort_values("回収率%", ascending=False).head(3)
+        print("\n  回収率上位:")
+        print(best.to_string(index=False, float_format=lambda v: f"{v:.1f}"))
+        if (me["95%下限"] > 100).any():
+            print("  ★下限が100%を超える区分がある。モデル無しで妙味あり★")
+        else:
+            print("  どの人気順位も回収率100%に届かない"
+                  "(控除率18.8%を考えれば正常)")
+
+        for key in ("n_starters", "baba_code", "class_rank"):
+            if key not in df:
+                continue
+            t = M.market_efficiency_by(df, pmap0, key)
+            if len(t):
+                print(f"\n  [1番人気・単勝] {key} 別 (上位5/下位3)")
+                print(pd.concat([t.head(5), t.tail(3)]).to_string(
+                    index=False, float_format=lambda v: f"{v:.1f}"))
+
     # ---- 分割 ----
     odds_ok = df[df["final_win_odds"].notna()]
     if len(odds_ok) == 0:
