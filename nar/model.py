@@ -438,6 +438,69 @@ def backtest_payouts(df: pd.DataFrame, p: np.ndarray, pmap: dict,
     return pd.DataFrame(rows)
 
 
+
+# =====================================================================
+# 市場そのものの効率性マップ
+#
+# ★モデルを作る前に確かめるべきだったこと★
+#   「どこで市場が間違えているか」を先に測る。
+#   全区分で回収率が控除率なりに沈んでいるなら、
+#   その券種でEV100%超を狙う前提そのものが崩れる。
+#
+#   人気順位は100%埋まっているので、オッズが無い期間も含めた
+#   全16,467レースで測れる。払戻テーブルがあれば足りる。
+# =====================================================================
+def market_efficiency(df: pd.DataFrame, pmap: dict,
+                      bets=("win", "place"), seed: int = 0) -> pd.DataFrame:
+    """人気順位ごとの回収率。単純に『N番人気を毎回買う』戦略の成績。"""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for bt in bets:
+        for pop, g in df.groupby("final_popularity"):
+            if pop is None or pop != pop or pop > 14 or len(g) < 100:
+                continue
+            ret = np.array([
+                float(pmap.get((r, bt, str(int(h))), 0))
+                for r, h in zip(g["race_id"], g["horse_no"])
+            ])
+            n = len(ret)
+            boots = [ret[rng.integers(0, n, n)].mean()
+                     for _ in range(300)] if n >= 100 else []
+            rows.append({
+                "券種": bt, "人気": int(pop), "点数": n,
+                "的中率%": (ret > 0).mean() * 100,
+                "回収率%": ret.mean(),
+                "95%下限": np.percentile(boots, 2.5) if boots else np.nan,
+                "95%上限": np.percentile(boots, 97.5) if boots else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def market_efficiency_by(df: pd.DataFrame, pmap: dict, key: str,
+                         bet: str = "win", top_pop: int = 1,
+                         seed: int = 0) -> pd.DataFrame:
+    """区分ごとに『top_pop番人気を買う』回収率。区分の偏りを探す。"""
+    rng = np.random.default_rng(seed)
+    sub = df[df["final_popularity"] == top_pop]
+    rows = []
+    for k, g in sub.groupby(key):
+        if len(g) < 100:
+            continue
+        ret = np.array([
+            float(pmap.get((r, bet, str(int(h))), 0))
+            for r, h in zip(g["race_id"], g["horse_no"])
+        ])
+        n = len(ret)
+        boots = [ret[rng.integers(0, n, n)].mean() for _ in range(200)]
+        rows.append({
+            key: k, "点数": n, "的中率%": (ret > 0).mean() * 100,
+            "回収率%": ret.mean(),
+            "95%下限": np.percentile(boots, 2.5),
+            "95%上限": np.percentile(boots, 97.5),
+        })
+    return pd.DataFrame(rows).sort_values("回収率%", ascending=False)
+
+
 def time_split(df: pd.DataFrame, cutoff: str):
     tr = df[df["race_date"] < cutoff].copy()
     te = df[df["race_date"] >= cutoff].copy()
