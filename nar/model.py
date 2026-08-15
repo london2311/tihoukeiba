@@ -501,6 +501,74 @@ def market_efficiency_by(df: pd.DataFrame, pmap: dict, key: str,
     return pd.DataFrame(rows).sort_values("回収率%", ascending=False)
 
 
+
+# =====================================================================
+# 組み合わせ券種の効率性
+#
+# ★単勝・複勝で歪みが見つからなくても、組み合わせ側にはあり得る★
+#   買い手は3頭の同時確率をうまく計算できないので、
+#   人気薄の組が買われすぎ、本命同士の組が相対的に安くなる
+#   (組み合わせ市場での人気薄バイアス)。
+#   控除率は三連単のほうが高い(約27.5%)ので不利だが、
+#   歪みがそれを上回るかどうかは実測しないと分からない。
+#
+#   人気順位は100%埋まっているので全16,467レースで測れる。
+# =====================================================================
+COMBO_PATTERNS = [
+    ("quinella", (1, 2)), ("quinella", (1, 3)), ("quinella", (2, 3)),
+    ("quinella", (1, 4)),
+    ("exacta", (1, 2)), ("exacta", (2, 1)), ("exacta", (1, 3)),
+    ("wide", (1, 2)), ("wide", (1, 3)), ("wide", (2, 3)), ("wide", (1, 4)),
+    ("trio", (1, 2, 3)), ("trio", (1, 2, 4)), ("trio", (1, 3, 4)),
+    ("trio", (1, 2, 5)), ("trio", (2, 3, 4)),
+    ("trifecta", (1, 2, 3)), ("trifecta", (1, 3, 2)), ("trifecta", (2, 1, 3)),
+    ("trifecta", (1, 2, 4)),
+]
+
+
+def _pop_map(df: pd.DataFrame) -> dict:
+    """race_id -> {人気順位: 馬番}"""
+    d = df[df["final_popularity"].notna()]
+    out = {}
+    for rid, pop, hno in zip(d["race_id"], d["final_popularity"],
+                             d["horse_no"]):
+        out.setdefault(rid, {})[int(pop)] = int(hno)
+    return out
+
+
+def combination_efficiency(df: pd.DataFrame, pmap: dict,
+                           patterns=COMBO_PATTERNS, seed: int = 0,
+                           min_n: int = 200) -> pd.DataFrame:
+    """『毎レース、人気N-M-Lの組を1点買う』戦略の回収率。"""
+    pm = _pop_map(df)
+    rng = np.random.default_rng(seed)
+    rows = []
+    for bt, pat in patterns:
+        rets = []
+        for rid, m in pm.items():
+            if not all(k in m for k in pat):
+                continue
+            sel = [m[k] for k in pat]
+            if len(set(sel)) != len(sel):
+                continue
+            key = "-".join(sorted((str(x) for x in sel), key=int)) \
+                if bt in UNORDERED else "-".join(str(x) for x in sel)
+            rets.append(float(pmap.get((rid, bt, key), 0)))
+        n = len(rets)
+        if n < min_n:
+            continue
+        r = np.array(rets)
+        boots = [r[rng.integers(0, n, n)].mean() for _ in range(300)]
+        rows.append({
+            "券種": bt, "人気パターン": "-".join(map(str, pat)), "点数": n,
+            "的中率%": (r > 0).mean() * 100,
+            "回収率%": r.mean(),
+            "95%下限": np.percentile(boots, 2.5),
+            "95%上限": np.percentile(boots, 97.5),
+        })
+    return pd.DataFrame(rows).sort_values("回収率%", ascending=False)
+
+
 def time_split(df: pd.DataFrame, cutoff: str):
     tr = df[df["race_date"] < cutoff].copy()
     te = df[df["race_date"] >= cutoff].copy()
