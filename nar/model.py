@@ -357,6 +357,87 @@ def backtest_win(df: pd.DataFrame, p: np.ndarray,
     return pd.DataFrame(rows)
 
 
+# =====================================================================
+# 払戻ベースのバックテスト (単勝以外も検証できる)
+#
+# ★これが使える理由★
+#   オッズは3,412レース分しか無いが、payouts は 198,072行あり
+#   全16,467レースを覆っている。
+#   買い目を決めてから「当たったらいくら戻るか」を見るだけなら、
+#   事前オッズは要らない。的中した組の払戻さえ分かればよい。
+#   → 複勝・ワイド・三連複などを全レースで検証できる。
+#
+#   制約: 事前オッズが無いので EV 閾値は掛けられない。
+#         「常に買う」戦略の回収率しか測れない。
+#         それでも「単勝以外に妙味があるか」の一次判定には十分。
+# =====================================================================
+UNORDERED = {"place", "quinella", "wide", "trio"}
+
+BET_PICK = {                      # (券種, 上位何頭を使うか)
+    "win":      1,
+    "place":    1,
+    "quinella": 2,
+    "exacta":   2,
+    "wide":     2,
+    "trio":     3,
+    "trifecta": 3,
+}
+
+
+def load_payout_map(con) -> dict:
+    """(race_id, bet_type, 正規化した組) -> 払戻円"""
+    out = {}
+    for rid, bt, comb, yen in con.execute(
+            "SELECT race_id, bet_type, combination, payout_yen FROM payouts"):
+        key = comb
+        if bt in UNORDERED:
+            key = "-".join(sorted(comb.split("-"), key=int))
+        out[(rid, bt, key)] = yen
+    return out
+
+
+def backtest_payouts(df: pd.DataFrame, p: np.ndarray, pmap: dict,
+                     bets=("win", "place", "quinella", "exacta",
+                           "wide", "trio", "trifecta"),
+                     stake: float = 100.0, label: str = "model",
+                     seed: int = 0) -> pd.DataFrame:
+    """各レースで確率上位n頭を1点だけ買う。回収率を券種ごとに出す。"""
+    d = pd.DataFrame({
+        "race_id": df["race_id"].values,
+        "horse_no": df["horse_no"].values,
+        "p": p,
+    }).sort_values(["race_id", "p"], ascending=[True, False])
+    picks = d.groupby("race_id")["horse_no"].apply(list)
+
+    rng = np.random.default_rng(seed)
+    rows = []
+    for bt in bets:
+        k = BET_PICK[bt]
+        rets, n = [], 0
+        for rid, hs in picks.items():
+            if len(hs) < k:
+                continue
+            sel = [str(int(x)) for x in hs[:k]]
+            key = "-".join(sorted(sel, key=int)) if bt in UNORDERED \
+                else "-".join(sel)
+            n += 1
+            rets.append(float(pmap.get((rid, bt, key), 0)))
+        if not n:
+            continue
+        r = np.array(rets)
+        bet_total = n * stake
+        boots = [r[rng.integers(0, n, n)].sum() / bet_total
+                 for _ in range(300)] if n >= 30 else []
+        rows.append({
+            "戦略": label, "券種": bt, "点数": n,
+            "的中": int((r > 0).sum()), "的中率%": (r > 0).mean() * 100,
+            "回収率%": r.sum() / bet_total * 100,
+            "95%下限": np.percentile(boots, 2.5) * 100 if boots else np.nan,
+            "95%上限": np.percentile(boots, 97.5) * 100 if boots else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
 def time_split(df: pd.DataFrame, cutoff: str):
     tr = df[df["race_date"] < cutoff].copy()
     te = df[df["race_date"] >= cutoff].copy()
