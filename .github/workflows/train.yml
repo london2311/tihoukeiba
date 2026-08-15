@@ -4,7 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       sweep:
-        description: '総当たり比較モード（正則化5段階 x 特徴集合2通り）'
+        description: '総当たり比較モード（模型2 x 特徴4通り x 正則化2段階）'
+        type: boolean
+        required: false
+        default: false
+      exact:
+        description: '厳密な条件付きロジットを使う（既定は従来の近似）'
+        type: boolean
+        required: false
+        default: false
+      with_market:
+        description: '市場の人気順位を特徴に入れる（市場を土台にして補正する方針）'
         type: boolean
         required: false
         default: false
@@ -20,8 +30,8 @@ on:
         description: '過去N走未満の馬を除く'
         required: false
         default: '3'
-      no_temp:
-        description: '温度較正を無効にする（較正の効果を測るとき用）'
+      temp:
+        description: '温度較正を有効にする（既定オフ。検証期で外れる実測あり）'
         type: boolean
         required: false
         default: false
@@ -104,7 +114,9 @@ jobs:
         run: |
           python -m nar.train \
             ${{ github.event.inputs.sweep == 'true' && '--sweep' || '' }} \
-            ${{ github.event.inputs.no_temp == 'true' && '--no-temp' || '' }} \
+            ${{ github.event.inputs.exact == 'true' && '--exact' || '' }} \
+            ${{ github.event.inputs.with_market == 'true' && '--with-market' || '' }} \
+            ${{ github.event.inputs.temp == 'true' && '--temp' || '' }} \
             ${{ github.event.inputs.cutoff && format('--cutoff {0}', github.event.inputs.cutoff) || '' }} \
             --C ${{ github.event.inputs.C || '1.0' }} \
             --min-starts ${{ github.event.inputs.min_starts || '3' }}
