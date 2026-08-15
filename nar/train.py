@@ -36,6 +36,9 @@ def main():
                          "学習末尾で当てたTは検証期で外れることが実測されている")
     ap.add_argument("--exact", action="store_true",
                     help="厳密な条件付きロジットを使う(既定は従来の近似)")
+    ap.add_argument("--with-odds", action="store_true",
+                    help="実オッズを特徴に入れ、オッズ完備レースだけで学習・検証する。"
+                         "実運用に最も近い構成")
     ap.add_argument("--with-market", action="store_true",
                     help="市場の人気順位を特徴に入れる。"
                          "『市場に勝つ』のではなく『市場を補正する』方針")
@@ -75,10 +78,12 @@ def main():
         mv = df["class_move"].notna().mean() * 100
         print(f"  class_rank 充足 {ok:5.1f}%  /  class_move 充足 {mv:5.1f}%")
 
-    # 過去走が薄い馬は除く(特徴が全部NaNなのでノイズにしかならない)
-    before = len(df)
-    df = df[df["career_starts"] >= a.min_starts]
-    print(f"  過去{a.min_starts}走以上に絞る: {before:,} -> {len(df):,}")
+    # ★min_starts は学習だけに掛ける。検証では絶対に出走頭を間引かない★
+    #   間引くとレース内 softmax が残った馬だけで1に正規化される。
+    #   本当の勝ち馬が間引かれていた場合、予測確率だけが水増しされ、
+    #   キャリブレーションもEVも実態より良く(高く)見える。
+    #   2026-08-15 の実測では 平均予測 0.118 / 平均実現 0.080 と
+    #   約1.5倍ずれていた。分割の後で学習側にだけ適用する。
 
     # -----------------------------------------------------------------
     # 市場特徴
@@ -92,6 +97,29 @@ def main():
     #   ※ final_popularity は締切時点の確定値。締切直前に賭ける前提なら
     #     使用は妥当だが、それより早く賭けるならズレる点に注意。
     # -----------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # 実オッズ構成
+    #   人気順位は「1.2倍の1番人気」と「3.0倍の1番人気」を区別できない。
+    #   実測ではその差が logloss 0.0070 分あり、自前特徴の上積み
+    #   0.0025 より大きい。実運用では発走前にオッズが見えるのだから、
+    #   これを土台に置くのが本来の姿。
+    #   ただしオッズは3,412レースにしか無いので、その中で切り直す。
+    # -----------------------------------------------------------------
+    ODDS_COLS = ["odds_logprob", "overround"]
+    if a.with_odds:
+        cov = (df.groupby("race_id")["final_win_odds"]
+                 .transform(lambda s: s.notna().mean()))
+        before_r = df["race_id"].nunique()
+        df = df[cov > 0.99].copy()
+        print(f"\n■ オッズ完備レースに限定: "
+              f"{before_r:,} -> {df['race_id'].nunique():,}レース "
+              f"/ {len(df):,}出走")
+        if df.empty:
+            print("!! オッズ完備レースが無い")
+            return
+        df["odds_logprob"] = np.log(
+            np.clip(M.market_prob_from_odds(df), 1e-6, 1.0))
+
     MARKET_COLS = ["mkt_rank", "mkt_logprob"]
     df["mkt_rank"] = df["final_popularity"].astype(float)
     df["mkt_logprob"] = np.log(
@@ -102,7 +130,14 @@ def main():
     if len(odds_ok) == 0:
         print("!! オッズがある行が無い。バックテストできない")
         return
-    cutoff = a.cutoff or str(odds_ok["race_date"].min())[:10]
+    if a.cutoff:
+        cutoff = a.cutoff
+    elif a.with_odds:
+        # オッズ完備区間の中で日付分割する(既定は後ろ40%を検証)
+        dts = df["race_date"].drop_duplicates().sort_values()
+        cutoff = str(dts.iloc[int(len(dts) * 0.6)])[:10]
+    else:
+        cutoff = str(odds_ok["race_date"].min())[:10]
     tr, te = M.time_split(df, cutoff)
     print(f"\n■ 時系列分割 (cutoff={cutoff})")
     print(f"  学習 {len(tr):,}出走 / {tr['race_id'].nunique():,}レース"
@@ -110,11 +145,17 @@ def main():
     print(f"  検証 {len(te):,}出走 / {te['race_id'].nunique():,}レース"
           f"  ({str(te['race_date'].min())[:10]} .. {str(te['race_date'].max())[:10]})")
 
-    allc = [c for c in FT.BASE_COLS + FT.RANK_COLS + MARKET_COLS
+    allc = [c for c in FT.BASE_COLS + FT.RANK_COLS + MARKET_COLS + ODDS_COLS
             if c in df.columns]
     cols = [c for c in FT.FEATURE_COLS if c in df.columns]
     if a.with_market:
         cols = cols + MARKET_COLS
+    if a.with_odds:
+        cols = cols + [c for c in ODDS_COLS if c in df.columns]
+    before = len(tr)
+    tr = tr[tr["career_starts"] >= a.min_starts]
+    print(f"  学習のみ過去{a.min_starts}走以上に絞る: {before:,} -> {len(tr):,}"
+          f"   (検証は {len(te):,} 出走を全頭のまま使う)")
     tr = tr.dropna(subset=["finish_pos"])
     te = te.dropna(subset=["finish_pos"])
     for d in (tr, te):
@@ -143,6 +184,11 @@ def main():
         sets = [("自前のみ", base), ("自前+順位", both),
                 ("自前+市場", base + MARKET_COLS),
                 ("市場のみ", MARKET_COLS)]
+        if a.with_odds:
+            oc = [c for c in ODDS_COLS if c in df.columns]
+            sets = [("自前+オッズ", base + oc), ("オッズのみ", oc),
+                    ("自前+市場+オッズ", base + MARKET_COLS + oc),
+                    ("自前のみ", base)]
         for mname, klass in variants:
             for label, cc in sets:
                 for C in (0.1, 1.0):
@@ -203,6 +249,13 @@ def main():
                                sub["race_id"]))
     r = pd.DataFrame(rows)
     print(r.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+
+    # 健全性: レース内softmaxなら 平均予測 == 平均実現 になるはず。
+    # ずれていたら出走頭を間引いている(=確率の水増し)。
+    mp, ma = p_model.mean(), y_te.mean()
+    print(f"\n  平均予測 {mp:.4f} / 平均実現 {ma:.4f}  比 {mp/max(ma,1e-9):.3f}")
+    if abs(mp / max(ma, 1e-9) - 1) > 0.03:
+        print("    !! 確率が水増しされている。出走頭の間引きを疑うこと")
 
     ll_m = r.loc[r["name"] == "model", "logloss"].iloc[0]
     ll_k = r.loc[r["name"].str.contains("実オッズ"), "logloss"]
