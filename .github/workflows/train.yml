@@ -18,6 +18,11 @@ on:
         type: boolean
         required: false
         default: false
+      with_odds:
+        description: '実オッズを特徴に入れ、オッズ完備3,412レースだけで学習・検証する'
+        type: boolean
+        required: false
+        default: false
       cutoff:
         description: '学習/検証の境界日 (空ならオッズ完備開始日)'
         required: false
@@ -116,6 +121,7 @@ jobs:
             ${{ github.event.inputs.sweep == 'true' && '--sweep' || '' }} \
             ${{ github.event.inputs.exact == 'true' && '--exact' || '' }} \
             ${{ github.event.inputs.with_market == 'true' && '--with-market' || '' }} \
+            ${{ github.event.inputs.with_odds == 'true' && '--with-odds' || '' }} \
             ${{ github.event.inputs.temp == 'true' && '--temp' || '' }} \
             ${{ github.event.inputs.cutoff && format('--cutoff {0}', github.event.inputs.cutoff) || '' }} \
             --C ${{ github.event.inputs.C || '1.0' }} \
