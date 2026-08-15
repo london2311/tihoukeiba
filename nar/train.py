@@ -20,6 +20,7 @@ import pandas as pd
 from .core import connect
 from . import features as FT
 from . import model as M
+from . import edge as EDGE
 
 
 def main():
@@ -164,6 +165,8 @@ def main():
                 print("\n  下限100%超は無いが、回収率90%超は存在する:")
                 print(near.to_string(index=False,
                                      float_format=lambda v: f"{v:.1f}"))
+
+        EDGE.report(con, df, pmap0)
 
         for key in ("n_starters", "baba_code", "class_rank"):
             if key not in df:
