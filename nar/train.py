@@ -36,7 +36,18 @@ def main():
     print("■ 特徴量生成")
     df = FT.build(con)
     FT.assert_no_leak(df)
+    # ★レース内 z化で消える特徴を検出する★
+    #   この模型はレース内で相対化するので、レース内定数は学習に寄与しない。
+    #   「40特徴あるつもりで実は24」という事故を機械的に防ぐ。
+    FT.assert_varies_within_race(df)
+    FT.coverage_report(df)
     print(f"  {len(df):,}出走 / {df['race_id'].nunique():,}レース")
+
+    # クラス復元の効き具合 (race_name から作り直したもの)
+    if "class_rank" in df:
+        ok = df["class_rank"].notna().mean() * 100
+        mv = df["class_move"].notna().mean() * 100
+        print(f"  class_rank 充足 {ok:5.1f}%  /  class_move 充足 {mv:5.1f}%")
 
     # 過去走が薄い馬は除く(特徴が全部NaNなのでノイズにしかならない)
     before = len(df)
